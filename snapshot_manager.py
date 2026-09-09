@@ -3,6 +3,8 @@ import io
 import re
 import hashlib
 import tarfile
+import tempfile
+import shutil
 import requests
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
@@ -183,6 +185,54 @@ class SnapshotManager:
         target_abs = os.path.abspath(target_path)
         return os.path.commonpath([dest_abs, target_abs]) == dest_abs
 
+    def validate_archive_members(self, tar: tarfile.TarFile, destination: str) -> tuple[bool, Optional[str]]:
+        """
+        Thoroughly validates all tar members for path traversal, symlink/hardlink escapes,
+        and nested symlink pivoting attacks before any extraction begins.
+        """
+        dest_abs = os.path.abspath(destination)
+        known_symlinks = set()
+
+        for member in tar.getmembers():
+            # 1. Check member name path traversal
+            target_path = os.path.join(dest_abs, member.name)
+            if not self._is_safe_path(dest_abs, target_path):
+                return False, f"INVALID_ARCHIVE_PATH: Detected path traversal attempt in member name '{member.name}'"
+
+            # 2. Check hardlink attacks (LNKTYPE)
+            if member.islnk():
+                link_target = os.path.join(dest_abs, member.linkname) if not os.path.isabs(member.linkname) else member.linkname
+                if not self._is_safe_path(dest_abs, link_target):
+                    return False, f"INVALID_ARCHIVE_HARDLINK: Hardlink '{member.name}' points outside destination: '{member.linkname}'"
+
+            # 3. Check symlink attacks (SYMTYPE)
+            if member.issym():
+                if os.path.isabs(member.linkname):
+                    return False, f"INVALID_ARCHIVE_SYMLINK: Absolute symlink not allowed in member '{member.name}' -> '{member.linkname}'"
+                
+                # Resolve relative symlink from the member's parent directory
+                member_dir = os.path.dirname(target_path)
+                resolved_link = os.path.abspath(os.path.join(member_dir, member.linkname))
+                if not self._is_safe_path(dest_abs, resolved_link):
+                    return False, f"INVALID_ARCHIVE_SYMLINK: Symlink '{member.name}' points outside destination: '{member.linkname}'"
+
+                known_symlinks.add(os.path.relpath(target_path, dest_abs))
+
+            # 4. Check pivoting through existing symlink directories
+            # If any parent directory in target_path is a registered symlink, reject to prevent pivot writing
+            rel_name = os.path.relpath(target_path, dest_abs)
+            parent = os.path.dirname(rel_name)
+            while parent and parent != ".":
+                if parent in known_symlinks:
+                    return False, f"INVALID_ARCHIVE_SYMLINK_PIVOT: Path '{member.name}' traverses through symlink '{parent}'"
+                parent = os.path.dirname(parent)
+
+            # 5. Reject device files, FIFOs, etc.
+            if member.isdev() or member.ischr() or member.isblk() or member.isfifo():
+                return False, f"INVALID_ARCHIVE_TYPE: Unsupported special device file in member '{member.name}'"
+
+        return True, None
+
     def restore_snapshot(self, snapshot_path: str, destination: str) -> SnapshotRestoreResult:
         abs_snap = os.path.abspath(snapshot_path)
         dest_abs = os.path.abspath(destination)
@@ -195,25 +245,46 @@ class SnapshotManager:
                 error_message=f"Cannot restore invalid snapshot: {inspect.error_message}"
             )
 
-        os.makedirs(dest_abs, exist_ok=True)
+        # Staging extraction in isolated temporary directory to ensure atomic / no-partial files on failure
+        staging_dir = tempfile.mkdtemp(prefix="agy_restore_stage_")
         extracted = []
 
         try:
             with tarfile.open(abs_snap, "r:*") as tar:
-                # Path Traversal Security Check
-                for member in tar.getmembers():
-                    target_path = os.path.join(dest_abs, member.name)
-                    if not self._is_safe_path(dest_abs, target_path):
-                        return SnapshotRestoreResult(
-                            success=False,
-                            destination=dest_abs,
-                            error_message=f"INVALID_ARCHIVE_PATH: Detected path traversal attempt in archive member '{member.name}'"
-                        )
+                # Pre-validation across all members
+                is_safe, err_msg = self.validate_archive_members(tar, staging_dir)
+                if not is_safe:
+                    return SnapshotRestoreResult(
+                        success=False,
+                        destination=dest_abs,
+                        error_message=err_msg
+                    )
 
-                # Safely extract files after verification
+                # Extract safely into staging_dir
                 for member in tar.getmembers():
-                    tar.extract(member, path=dest_abs)
+                    tar.extract(member, path=staging_dir)
                     extracted.append(member.name)
+
+            # Move verified files into destination
+            os.makedirs(dest_abs, exist_ok=True)
+            for item in os.listdir(staging_dir):
+                s_item = os.path.join(staging_dir, item)
+                d_item = os.path.join(dest_abs, item)
+                if os.path.islink(s_item):
+                    link_target = os.readlink(s_item)
+                    if os.path.lexists(d_item):
+                        if os.path.isdir(d_item) and not os.path.islink(d_item):
+                            shutil.rmtree(d_item)
+                        else:
+                            os.remove(d_item)
+                    os.symlink(link_target, d_item)
+                elif os.path.isdir(s_item):
+                    if os.path.exists(d_item):
+                        shutil.copytree(s_item, d_item, symlinks=True, dirs_exist_ok=True)
+                    else:
+                        shutil.copytree(s_item, d_item, symlinks=True)
+                else:
+                    shutil.copy2(s_item, d_item, follow_symlinks=False)
 
             return SnapshotRestoreResult(
                 success=True,
@@ -227,3 +298,5 @@ class SnapshotManager:
                 destination=dest_abs,
                 error_message=mask_credentials(f"Restore failed: {e}")
             )
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)

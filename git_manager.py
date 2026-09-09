@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 import subprocess
 from enum import Enum
 from dataclasses import dataclass, field
@@ -64,14 +65,18 @@ class GitManager:
     def __init__(self, repo_path: str):
         self.repo_path = os.path.abspath(os.path.expanduser(repo_path))
 
-    def _run_git(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
+    def _run_git(self, args: List[str], env: Optional[Dict[str, str]] = None, check: bool = False) -> subprocess.CompletedProcess:
         """Executes a git command in repo_path and captures output safely."""
         cmd = ["git", "-C", self.repo_path] + args
+        run_env = os.environ.copy()
+        if env:
+            run_env.update(env)
         try:
             res = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                env=run_env,
                 check=check
             )
             return res
@@ -132,8 +137,6 @@ class GitManager:
             work_status = line[1]
             filepath = line[3:].strip()
 
-            # Unmerged/conflict states in git status --porcelain:
-            # DD, AU, UD, UA, DU, AA, UU
             if (idx_status, work_status) in [('U','U'), ('A','A'), ('D','D'), ('A','U'), ('U','D'), ('U','A'), ('D','U')]:
                 conflicts.append(filepath)
             elif idx_status in ['M', 'A', 'D', 'R', 'C']:
@@ -189,6 +192,88 @@ class GitManager:
                 status=GitOpStatus.CONFLICT,
                 error_message="Cannot create checkpoint commit: merge conflicts exist in repository."
             )
+
+        if files:
+            # Safe checkpoint: commit ONLY specified files without polluting or touching user's existing staged index
+            # We use an isolated temporary GIT_INDEX_FILE
+            with tempfile.NamedTemporaryFile(prefix="agy_git_idx_") as tf:
+                temp_index_path = tf.name
+
+            try:
+                env = {"GIT_INDEX_FILE": temp_index_path}
+                # 1. Populate temp index from current HEAD if HEAD exists
+                if status.head_commit:
+                    read_res = self._run_git(["read-tree", "HEAD"], env=env)
+                    if read_res.returncode != 0:
+                        return GitOperationResult(
+                            status=GitOpStatus.ERROR,
+                            error_message=f"Failed to read HEAD into temporary index: {read_res.stderr}"
+                        )
+
+                # 2. Add ONLY the explicitly requested files into the temp index
+                add_res = self._run_git(["add", "--"] + files, env=env)
+                if add_res.returncode != 0:
+                    return GitOperationResult(
+                        status=GitOpStatus.ERROR,
+                        error_message=f"Failed to stage checkpoint files into temporary index: {add_res.stderr}"
+                    )
+
+                # 3. Write tree from temp index
+                wt_res = self._run_git(["write-tree"], env=env)
+                if wt_res.returncode != 0:
+                    return GitOperationResult(
+                        status=GitOpStatus.ERROR,
+                        error_message=f"Failed to write tree from temporary index: {wt_res.stderr}"
+                    )
+                new_tree = wt_res.stdout.strip()
+
+                # Check if tree actually changed compared to HEAD
+                if status.head_commit:
+                    head_tree_res = self._run_git(["rev-parse", f"{status.head_commit}^{{tree}}"])
+                    if head_tree_res.returncode == 0 and head_tree_res.stdout.strip() == new_tree:
+                        return GitOperationResult(
+                            status=GitOpStatus.NOTHING_TO_COMMIT,
+                            commit_sha=status.head_commit,
+                            output="No changes detected in specified checkpoint files."
+                        )
+
+                # 4. Commit tree
+                commit_args = ["commit-tree", new_tree, "-m", message]
+                if status.head_commit:
+                    commit_args.extend(["-p", status.head_commit])
+
+                ct_res = self._run_git(commit_args, env=env)
+                if ct_res.returncode != 0:
+                    return GitOperationResult(
+                        status=GitOpStatus.ERROR,
+                        error_message=f"Failed to create commit tree: {ct_res.stderr}"
+                    )
+                new_commit_sha = ct_res.stdout.strip()
+
+                # 5. Update branch ref (or HEAD if detached)
+                target_ref = f"refs/heads/{status.branch}" if status.branch and status.branch != "HEAD" else "HEAD"
+                ref_res = self._run_git(["update-ref", target_ref, new_commit_sha])
+                if ref_res.returncode != 0:
+                    return GitOperationResult(
+                        status=GitOpStatus.ERROR,
+                        error_message=f"Failed to update ref '{target_ref}': {ref_res.stderr}"
+                    )
+
+                return GitOperationResult(
+                    status=GitOpStatus.COMMITTED,
+                    commit_sha=new_commit_sha,
+                    commit_message=message,
+                    files_affected=files,
+                    output=f"Committed {len(files)} files via isolated index."
+                )
+            finally:
+                if os.path.exists(temp_index_path):
+                    try:
+                        os.remove(temp_index_path)
+                    except OSError:
+                        pass
+
+        # If no explicit files specified: check if anything has changed across working tree
         if not status.has_changes:
             return GitOperationResult(
                 status=GitOpStatus.NOTHING_TO_COMMIT,
@@ -196,12 +281,8 @@ class GitManager:
                 output="Working tree is clean. Nothing to commit."
             )
 
-        if files:
-            add_args = ["add", "--"] + files
-            affected = files
-        else:
-            add_args = ["add", "-A"]
-            affected = status.staged_files + status.unstaged_files + status.untracked_files
+        add_args = ["add", "-A"]
+        affected = status.staged_files + status.unstaged_files + status.untracked_files
 
         add_res = self._run_git(add_args)
         if add_res.returncode != 0:
