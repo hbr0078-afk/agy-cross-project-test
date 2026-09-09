@@ -6,6 +6,7 @@ from keys import get_api_key_by_index
 from client import AntigravityClient
 from registry import ProjectRegistry, RegistryCorruptedError
 from git_manager import GitManager, GitState, GitOpStatus
+from snapshot_manager import SnapshotManager
 
 def cmd_test_agent(args):
     api_key = ***)
@@ -166,7 +167,6 @@ def cmd_git_checkpoint(args):
         print(f"    - Commit SHA: {res.commit_sha[:7] if res.commit_sha else 'unknown'}")
         print(f"    - Message:    {res.commit_message}")
         print(f"    - Files:      {', '.join(res.files_affected)}")
-        # Update registry if registered
         try:
             registry = ProjectRegistry()
             p = registry.find_project_by_path(repo_path)
@@ -196,6 +196,52 @@ def cmd_git_pull(args):
         print(f"[+] Git pull successful from {args.remote} (HEAD: {res.commit_sha[:7] if res.commit_sha else 'unknown'})")
     else:
         print(f"[!] Git pull failed ({res.status.value}): {res.error_message}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_snapshot_download(args):
+    sm = SnapshotManager(key_index=args.key_index)
+    dest = args.destination or f"environment-{args.environment_id}.tar"
+    print(f"[*] Downloading snapshot for environment-{args.environment_id}...")
+    res = sm.download_snapshot(args.environment_id, dest)
+    if res.success:
+        print(f"[+] Snapshot downloaded successfully:")
+        print(f"    - Saved to:       {res.snapshot_path}")
+        print(f"    - Environment ID: {res.environment_id}")
+        print(f"    - Size (bytes):   {res.size_bytes}")
+        print(f"    - SHA256:         {res.sha256}")
+    else:
+        print(f"[!] Snapshot download failed: {res.error_message}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_snapshot_inspect(args):
+    sm = SnapshotManager()
+    insp = sm.inspect_snapshot(args.snapshot)
+    if insp.is_valid:
+        print(f"=== Snapshot Metadata ===")
+        print(f"Path:            {insp.snapshot_path}")
+        print(f"Size (bytes):    {insp.size_bytes}")
+        print(f"SHA256:          {insp.sha256}")
+        print(f"File Count:      {insp.file_count}")
+        print(f"Has Workspace:   {insp.has_workspace}")
+        print(f"Workspace Files: {len(insp.workspace_files)}")
+        print("\n--- File List ---")
+        for f in insp.file_list:
+            print(f"  {f}")
+        print("=========================")
+    else:
+        print(f"[!] Snapshot inspection failed: {insp.error_message}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_snapshot_restore(args):
+    sm = SnapshotManager()
+    print(f"[*] Restoring snapshot '{args.snapshot}' to '{args.destination}'...")
+    res = sm.restore_snapshot(args.snapshot, args.destination)
+    if res.success:
+        print(f"[+] Snapshot restored successfully:")
+        print(f"    - Destination:     {res.destination}")
+        print(f"    - Files Extracted: {len(res.files_extracted)}")
+    else:
+        print(f"[!] Snapshot restore failed: {res.error_message}", file=sys.stderr)
         sys.exit(1)
 
 def main():
@@ -250,6 +296,25 @@ def main():
     g_pull.add_argument("--branch", type=str, default=None, help="Branch name")
     g_pull.add_argument("--path", type=str, default=None, help="Repo path")
     g_pull.set_defaults(func=cmd_git_pull)
+
+    # snapshot
+    snap_parser = subparsers.add_parser("snapshot", help="Download, inspect, and restore environment snapshots")
+    snap_sub = snap_parser.add_subparsers(dest="snapshot_cmd", help="Snapshot commands")
+    
+    s_dl = snap_sub.add_parser("download", help="Download remote environment snapshot tar archive")
+    s_dl.add_argument("environment_id", type=str, help="Environment ID")
+    s_dl.add_argument("destination", type=str, nargs="?", default=None, help="Destination file or directory path")
+    s_dl.add_argument("--key-index", type=int, default=1, help="API key index (default: 1)")
+    s_dl.set_defaults(func=cmd_snapshot_download)
+
+    s_insp = snap_sub.add_parser("inspect", help="Inspect snapshot metadata and file contents")
+    s_insp.add_argument("snapshot", type=str, help="Path to snapshot tar archive")
+    s_insp.set_defaults(func=cmd_snapshot_inspect)
+
+    s_rst = snap_sub.add_parser("restore", help="Safely restore snapshot to destination directory")
+    s_rst.add_argument("snapshot", type=str, help="Path to snapshot tar archive")
+    s_rst.add_argument("destination", type=str, help="Destination directory path")
+    s_rst.set_defaults(func=cmd_snapshot_restore)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):
