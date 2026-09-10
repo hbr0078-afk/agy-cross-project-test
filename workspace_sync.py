@@ -5,6 +5,7 @@ import hashlib
 import tempfile
 import tarfile
 import base64
+import shutil
 import requests
 from enum import Enum
 from dataclasses import dataclass, field
@@ -69,7 +70,9 @@ class WorkspaceSync:
         if not rel_path or os.path.isabs(rel_path):
             return False
         normalized = os.path.normpath(rel_path)
-        if normalized.startswith("..") or "/.." in normalized or "\\.." in normalized:
+        if normalized == ".." or normalized.startswith(".." + os.sep) or normalized.startswith("../") or "/../" in normalized or "\\..\\" in normalized:
+            return False
+        if normalized.startswith(".."):
             return False
         return True
 
@@ -146,11 +149,11 @@ class WorkspaceSync:
 
         temp_dir = tempfile.mkdtemp(prefix="agy_git_src_")
         try:
-            archive_res = gm._run_git(["archive", target_commit])
+            archive_res = gm._run_git_bytes(["archive", target_commit])
             if archive_res.returncode != 0:
                 return None, f"Failed to archive git commit '{target_commit}': {archive_res.stderr}"
 
-            raw_bytes = archive_res.stdout.encode('latin1') if isinstance(archive_res.stdout, str) else archive_res.stdout
+            raw_bytes = archive_res.stdout
             with tarfile.open(fileobj=io.BytesIO(raw_bytes), mode="r:*") as tar:
                 tar.extractall(path=temp_dir)
 
@@ -169,9 +172,10 @@ class WorkspaceSync:
         """
         Check remote workspace for conflicts.
         Distinguishes clearly between:
-        - clean workspace
-        - actual conflicts
-        - API endpoint unavailable / 404 / 403 / failure -> UNKNOWN_CANNOT_VERIFY
+        - clean workspace: ([], None, None)
+        - actual conflicts: (conflicts, None, None)
+        - non-existent environment: ([], "ENVIRONMENT_NOT_FOUND", msg)
+        - API failure / auth error: ([], "UNKNOWN_CANNOT_VERIFY", msg)
         """
         clean_env_id = environment_id.replace("environment-", "")
         api_key = get_api_key_by_index(self.key_index)
@@ -185,23 +189,26 @@ class WorkspaceSync:
             res = requests.get(url, headers=headers, timeout=30)
             if res.status_code == 404:
                 # Distinguish if environment itself is not found vs empty directory
-                if "not found" in res.text.lower():
+                err_text = res.text.lower()
+                if f"environment '{clean_env_id}' not found" in err_text or "environment not found" in err_text:
                     return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found."
+                # If path 'workspace' not found, it means workspace folder is empty/clean
                 return [], None, None
-            if res.status_code == 403 or res.status_code == 401:
+            if res.status_code == 400:
+                return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found or invalid."
+            if res.status_code in (401, 403):
                 return [], "UNKNOWN_CANNOT_VERIFY", f"Authentication failed when checking remote conflicts (HTTP {res.status_code})."
             if res.status_code != 200:
-                # Endpoint may not support listing directly or server error
                 return [], "UNKNOWN_CANNOT_VERIFY", f"Cannot verify remote conflicts: HTTP {res.status_code}: {res.text[:100]}"
 
             data = res.json()
             remote_files = data.get("files", [])
             remote_paths = set()
             for rf in remote_files:
-                r_path = rf.get("path", "")
-                if r_path.startswith("workspace/"):
-                    rel = r_path[10:]
-                    remote_paths.add(rel)
+                p = rf.get("name", "")
+                if p.startswith("/workspace/"):
+                    p = p[len("/workspace/"):]
+                remote_paths.add(p)
 
             conflicts = []
             for rel_path in manifest.files.keys():
@@ -216,10 +223,26 @@ class WorkspaceSync:
         self,
         environment_id: str,
         manifest: SourceManifest,
-        overwrite: bool = False,
-        destination: str = "/workspace"
+        overwrite: bool = False
     ) -> SyncResult:
+        """
+        Synchronizes files from SourceManifest into the remote Antigravity environment.
+        - Validates paths first (fails fast on path traversal)
+        - Checks payload & file size boundaries
+        - Checks conflicts / fail-safe on unverified remote state
+        - Injects files & verifies integrity via SHA256 in single interaction
+        """
         clean_env_id = environment_id.replace("environment-", "")
+
+        # 1. Path safety check on all manifest files first (Fail-fast)
+        for rel_path in manifest.files.keys():
+            if not self._is_safe_rel_path(rel_path):
+                return SyncResult(
+                    status=SyncStatus.INVALID_PATH,
+                    environment_id=clean_env_id,
+                    error_message=f"INVALID_PATH: Path traversal attempt detected in path '{rel_path}'."
+                )
+
         api_key = get_api_key_by_index(self.key_index)
         if not api_key:
             return SyncResult(
@@ -228,7 +251,7 @@ class WorkspaceSync:
                 error_message=f"No API key available for index {self.key_index}."
             )
 
-        # Check payload size limits
+        # 2. Check payload size limits (Fail-fast)
         if manifest.total_size > MAX_TOTAL_PAYLOAD_BYTES:
             return SyncResult(
                 status=SyncStatus.PAYLOAD_TOO_LARGE,
@@ -241,22 +264,28 @@ class WorkspaceSync:
                 return SyncResult(
                     status=SyncStatus.FILE_TOO_LARGE,
                     environment_id=clean_env_id,
-                    error_message=f"File '{rel_path}' size ({info['size']} bytes) exceeds limit ({MAX_FILE_SIZE_BYTES} bytes)."
+                    error_message=f"File '{rel_path}' size ({info['size']} bytes) exceeds per-file limit ({MAX_FILE_SIZE_BYTES} bytes)."
                 )
 
-        # Conflict check with fail-safe UNKNOWN handling
-        conflicts, err_type, err_msg = self.check_remote_conflicts(clean_env_id, manifest)
+        # 3. Remote conflict check with fail-safe unpacking
+        conflict_res = self.check_remote_conflicts(clean_env_id, manifest)
+        if len(conflict_res) == 2:
+            conflicts, err_msg = conflict_res
+            err_type = "ERROR" if err_msg else None
+        else:
+            conflicts, err_type, err_msg = conflict_res
+
         if err_type == "ENVIRONMENT_NOT_FOUND":
             return SyncResult(
                 status=SyncStatus.ENVIRONMENT_NOT_FOUND,
                 environment_id=clean_env_id,
-                error_message=err_msg
+                error_message=err_msg or f"Environment '{clean_env_id}' not found."
             )
-        if err_type == "UNKNOWN_CANNOT_VERIFY" and not overwrite:
+        elif err_type == "UNKNOWN_CANNOT_VERIFY" or (err_msg and not conflicts):
             return SyncResult(
-                status=SyncStatus.UNKNOWN_CANNOT_VERIFY,
+                status=SyncStatus.UNKNOWN_CANNOT_VERIFY if err_type == "UNKNOWN_CANNOT_VERIFY" else SyncStatus.ERROR,
                 environment_id=clean_env_id,
-                error_message=f"UNKNOWN_CANNOT_VERIFY: Cannot verify remote workspace state: {err_msg}. Use overwrite=True to proceed intentionally."
+                error_message=err_msg or "Cannot verify remote state."
             )
 
         if conflicts and not overwrite:
@@ -264,73 +293,73 @@ class WorkspaceSync:
                 status=SyncStatus.CONFLICT,
                 environment_id=clean_env_id,
                 skipped_files=conflicts,
-                error_message=f"CONFLICT: {len(conflicts)} files already exist in remote /workspace ({', '.join(conflicts[:3])}). Use overwrite=True to replace."
+                error_message=f"CONFLICT: {len(conflicts)} files already exist on remote. Set overwrite=True to overwrite."
             )
 
-        client = AntigravityClient(api_key=api_key)
-
-        # Single Interaction Pattern: file injection + python sha256 integrity reporting in 1 prompt
-        prompt_lines = [
-            "We are setting up the project workspace in /workspace.",
-            "Write the following files precisely according to their encodings and verify their SHA256 checksums.\n"
+        # 4. Construct payload for single interaction injection & verification
+        python_unpack_lines = [
+            "import os, base64, hashlib",
+            "os.makedirs('/workspace', exist_ok=True)",
+            "files_data = {"
         ]
 
         for rel_path, info in manifest.files.items():
-            if not self._is_safe_rel_path(rel_path):
-                return SyncResult(
-                    status=SyncStatus.INVALID_PATH,
-                    environment_id=clean_env_id,
-                    error_message=f"INVALID_PATH: Path traversal attempt detected in '{rel_path}'."
-                )
+            b64_content = base64.b64encode(info["content"]).decode("ascii")
+            python_unpack_lines.append(f"    {repr(rel_path)}: {repr(b64_content)},")
 
-            target_path = os.path.join(destination, rel_path)
+        python_unpack_lines.extend([
+            "}",
+            "print('---INTEGRITY_REPORT_START---')",
+            "for rel_path, b64_str in files_data.items():",
+            "    target = os.path.join('/workspace', rel_path)",
+            "    os.makedirs(os.path.dirname(target), exist_ok=True)",
+            "    raw = base64.b64decode(b64_str)",
+            "    with open(target, 'wb') as f: f.write(raw)",
+            "    size = len(raw)",
+            "    sha = hashlib.sha256(raw).hexdigest()",
+            "    print(f'FILE:{rel_path}|SIZE:{size}|SHA256:{sha}')",
+            "print('---INTEGRITY_REPORT_END---')",
+            "print('WORKSPACE_SYNC_COMPLETE')"
+        ])
 
-            if info.get("is_binary"):
-                b64_str = base64.b64encode(info["content"]).decode("ascii")
-                prompt_lines.append(f"File '{target_path}' (BINARY Base64, size={info['size']}, sha256={info['sha256']}):")
-                prompt_lines.append(f"BASE64_START:{target_path}")
-                prompt_lines.append(b64_str)
-                prompt_lines.append(f"BASE64_END:{target_path}\n")
-            else:
-                content_str = info["content"].decode("utf-8", errors="replace")
-                prompt_lines.append(f"File '{target_path}' (TEXT UTF-8, size={info['size']}, sha256={info['sha256']}):")
-                prompt_lines.append(f"CONTENT_START:{target_path}")
-                prompt_lines.append(content_str)
-                prompt_lines.append(f"CONTENT_END:{target_path}\n")
-
-        prompt_lines.append(
-            "Execute the file creation. After writing all files, run a sha256 verification and reply STRICTLY in this format:\n"
-            "---INTEGRITY_REPORT_START---\n"
-            "For each created file in destination, output a single line:\n"
-            "FILE:<rel_path>|SIZE:<bytes>|SHA256:<hex_digest>\n"
-            "---INTEGRITY_REPORT_END---\n"
-            "End your final message with: WORKSPACE_SYNC_COMPLETE"
+        script_body = "\n".join(python_unpack_lines)
+        prompt = (
+            f"Please run the following python synchronization script to populate /workspace:\n"
+            f"```python\n{script_body}\n```\n"
+            f"Execute it and print the output exactly."
         )
 
-        full_prompt = "\n".join(prompt_lines)
-
+        client = AntigravityClient(api_key=api_key)
         res = client.create_interaction(
-            prompt=full_prompt,
+            prompt=prompt,
             environment="remote",
             environment_id=clean_env_id
         )
 
         if not res.get("success"):
+            status_code = res.get("status_code", 0)
+            err = res.get("error", "Unknown error")
+            if status_code == 404 or "not found" in str(err).lower():
+                sync_status = SyncStatus.ENVIRONMENT_NOT_FOUND
+            else:
+                sync_status = SyncStatus.TRANSFER_FAILED
+
             return SyncResult(
-                status=SyncStatus.TRANSFER_FAILED,
+                status=sync_status,
                 environment_id=clean_env_id,
-                error_message=mask_credentials(f"TRANSFER_FAILED: Interaction call failed with HTTP {res.get('status_code')}: {res.get('error')}")
+                error_message=mask_credentials(f"Transfer failed: {err}")
             )
 
         output = res.get("output", "")
-        # Verify integrity directly from interaction response
-        integrity_check = self.parse_and_verify_integrity(output, manifest)
-        if not integrity_check["verified"]:
+        verification = self.parse_and_verify_integrity(output, manifest)
+
+        if not verification.get("verified"):
             return SyncResult(
                 status=SyncStatus.VERIFY_FAILED,
                 environment_id=clean_env_id,
                 synced_files=list(manifest.files.keys()),
-                error_message=integrity_check["error_message"]
+                verified_files=verification.get("verified_files", []),
+                error_message=mask_credentials(f"VERIFY_FAILED: {verification.get('error_message')}")
             )
 
         return SyncResult(
@@ -339,70 +368,79 @@ class WorkspaceSync:
             source_path=manifest.source_path,
             commit_sha=manifest.commit_sha,
             synced_files=list(manifest.files.keys()),
-            verified_files=integrity_check["verified_files"],
-            output="Workspace sync completed and verified with SHA256 integrity successfully."
+            verified_files=verification.get("verified_files", []),
+            output=output
         )
 
-    def parse_and_verify_integrity(self, output: str, manifest: SourceManifest) -> Dict[str, Any]:
+    def parse_and_verify_integrity(self, report_text: str, manifest: SourceManifest) -> Dict[str, Any]:
         """
-        Validates that every file in manifest matches size and SHA256 exactly.
-        Rejects on missing files, size mismatches, or checksum mismatches.
+        Strictly parses structured integrity report:
+        ---INTEGRITY_REPORT_START---
+        FILE:<rel_path>|SIZE:<size>|SHA256:<sha256>
+        ---INTEGRITY_REPORT_END---
+        Verifies exact relative path, file size, and sha256. Fails on spoofed/extra/missing data.
         """
-        if not output:
-            return {
-                "verified": False,
-                "verified_files": [],
-                "error_message": "VERIFY_FAILED: Remote output is empty, cannot verify integrity."
-            }
+        if not report_text:
+            return {"verified": False, "verified_files": [], "error_message": "Empty integrity report"}
 
-        report_pattern = re.compile(r"FILE:([^|\s]+)\|SIZE:(\d+)\|SHA256:([a-fA-F0-9]{64})")
-        found_records = {}
+        start_marker = "---INTEGRITY_REPORT_START---"
+        end_marker = "---INTEGRITY_REPORT_END---"
 
-        for line in output.splitlines():
+        if start_marker not in report_text or end_marker not in report_text:
+            return {"verified": False, "verified_files": [], "error_message": "Malformed remote response: missing integrity markers"}
+
+        try:
+            section = report_text.split(start_marker, 1)[1].split(end_marker, 1)[0]
+        except Exception:
+            return {"verified": False, "verified_files": [], "error_message": "Malformed remote response: cannot slice integrity section"}
+
+        reported_files = {}
+        for line in section.strip().splitlines():
             line = line.strip()
-            m = report_pattern.search(line)
-            if m:
-                path = m.group(1).lstrip("/")
-                if path.startswith("workspace/"):
-                    path = path[10:]
-                size = int(m.group(2))
-                sha = m.group(3).lower()
-                found_records[path] = {"size": size, "sha256": sha}
+            if not line:
+                continue
+            m = re.match(r"^FILE:(.+?)\|SIZE:(\d+)\|SHA256:([a-fA-F0-9]+)$", line)
+            if not m:
+                return {"verified": False, "verified_files": [], "error_message": f"Malformed integrity report line: '{line}'"}
+
+            r_path, r_size, r_sha = m.group(1).strip(), int(m.group(2)), m.group(3).lower()
+            if r_path in reported_files:
+                return {"verified": False, "verified_files": [], "error_message": f"Duplicate file reported in integrity report: '{r_path}'"}
+            reported_files[r_path] = {"size": r_size, "sha256": r_sha}
+
+        # Ensure no extra unexpected files
+        for r_path in reported_files.keys():
+            if r_path not in manifest.files:
+                return {
+                    "verified": False,
+                    "verified_files": [],
+                    "error_message": f"Unexpected extra file reported on remote: '{r_path}'"
+                }
 
         verified_files = []
         for rel_path, expected in manifest.files.items():
-            norm_rel = os.path.normpath(rel_path)
-            record = found_records.get(norm_rel) or found_records.get(rel_path) or found_records.get(os.path.basename(rel_path))
-
-            if not record:
-                # Check fallback if output mentions exact sha256 and size
-                if expected["sha256"] in output:
-                    verified_files.append(rel_path)
-                    continue
+            if rel_path not in reported_files:
                 return {
                     "verified": False,
                     "verified_files": verified_files,
-                    "error_message": f"VERIFY_FAILED: File '{rel_path}' missing from remote integrity report."
+                    "error_message": f"Missing file in remote report: '{rel_path}'"
                 }
 
-            if record["size"] != expected["size"]:
+            actual = reported_files[rel_path]
+            if actual["size"] != expected["size"]:
                 return {
                     "verified": False,
                     "verified_files": verified_files,
-                    "error_message": f"VERIFY_FAILED: Size mismatch for '{rel_path}': expected {expected['size']} bytes, got {record['size']} bytes."
+                    "error_message": f"Size mismatch for '{rel_path}': expected {expected['size']}, got {actual['size']}"
                 }
 
-            if record["sha256"] != expected["sha256"].lower():
+            if actual["sha256"].lower() != expected["sha256"].lower():
                 return {
                     "verified": False,
                     "verified_files": verified_files,
-                    "error_message": f"VERIFY_FAILED: SHA256 mismatch for '{rel_path}': expected {expected['sha256']}, got {record['sha256']}."
+                    "error_message": f"SHA256 mismatch for '{rel_path}': expected {expected['sha256']}, got {actual['sha256']}"
                 }
 
             verified_files.append(rel_path)
 
-        return {
-            "verified": True,
-            "verified_files": verified_files,
-            "error_message": None
-        }
+        return {"verified": True, "verified_files": verified_files, "error_message": None}

@@ -65,6 +65,13 @@ class GitManager:
     def __init__(self, repo_path: str):
         self.repo_path = os.path.abspath(os.path.expanduser(repo_path))
 
+    def _run_git_bytes(self, args: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        cmd = ["git", "-C", self.repo_path] + args
+        run_env = os.environ.copy()
+        if env:
+            run_env.update(env)
+        return subprocess.run(cmd, capture_output=True, env=run_env)
+
     def _run_git(self, args: List[str], env: Optional[Dict[str, str]] = None, check: bool = False) -> subprocess.CompletedProcess:
         """Executes a git command in repo_path and captures output safely."""
         cmd = ["git", "-C", self.repo_path] + args
