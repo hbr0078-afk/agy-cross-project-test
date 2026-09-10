@@ -337,3 +337,111 @@ class TestP4HTTPClassificationAudit(unittest.TestCase):
             conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-g", self.dummy_manifest)
             self.assertEqual(err_type, "UNKNOWN_CANNOT_VERIFY")
             self.assertIn("timed out", err_msg)
+
+class TestP3ConflictDetectionSemantics(unittest.TestCase):
+    """Regression tests for P3 WorkspaceSync remote conflict detection semantics (Cases 1-7)."""
+
+    def setUp(self):
+        self.ws = WorkspaceSync(key_index=1)
+
+    def test_p3_case_1_and_2_same_and_different_hash_when_supported(self):
+        manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={
+                "same.txt": {"content": b"hello", "size": 5, "sha256": "hash_same"},
+                "diff.txt": {"content": b"world", "size": 5, "sha256": "hash_diff_local"}
+            }
+        )
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "files": [
+                {"name": "same.txt", "path": "workspace/same.txt", "sha256": "hash_same"},
+                {"name": "diff.txt", "path": "workspace/diff.txt", "sha256": "hash_diff_remote"}
+            ]
+        }
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-test", manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, ["diff.txt"])
+
+    def test_p3_case_3_and_4_local_only_and_remote_only(self):
+        manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={
+                "local_only.txt": {"content": b"abc", "size": 3, "sha256": "hash_loc"}
+            }
+        )
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "files": [
+                {"name": "remote_only.txt", "path": "workspace/remote_only.txt", "size_bytes": "10"}
+            ]
+        }
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-test", manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, [])
+
+    def test_p3_case_5_remote_extra_file_preserved(self):
+        manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={
+                "app.py": {"content": b"print(1)", "size": 8, "sha256": "hash_app"}
+            }
+        )
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "files": [
+                {"name": "extra.txt", "path": "workspace/extra.txt", "size_bytes": "50"}
+            ]
+        }
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-test", manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, [])
+
+    def test_p3_case_6_overwrite_true_bypasses_conflict(self):
+        manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={
+                "conflict.txt": {"content": b"abc", "size": 3, "sha256": "hash1"}
+            }
+        )
+        self.ws.check_remote_conflicts = mock.Mock(return_value=(["conflict.txt"], None, None))
+        
+        # Test that with overwrite=False -> CONFLICT
+        res_fail = self.ws.sync_to_remote("env-test", manifest, overwrite=False)
+        self.assertEqual(res_fail.status, SyncStatus.CONFLICT)
+
+    def test_p3_case_7_no_hash_api_fallback_to_failsafe_path_conflict(self):
+        # Actual Antigravity API behavior: size_bytes, name, path, type are present, but no sha256
+        manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={
+                "test.txt": {"content": b"hello", "size": 6, "sha256": "hash_local"}
+            }
+        )
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "files": [
+                {
+                    "name": "test.txt",
+                    "path": "workspace/test.txt",
+                    "type": "FILE",
+                    "size_bytes": "6"
+                }
+            ]
+        }
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-test", manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, ["test.txt"])

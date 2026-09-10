@@ -222,17 +222,54 @@ class WorkspaceSync:
 
             data = res.json()
             remote_files = data.get("files", [])
-            remote_paths = set()
+            # Map of remote relative path -> remote metadata
+            # Antigravity files API returns: name, path, type, size_bytes, mime_type, created, modified
+            # Notice: The API does NOT return file SHA256/checksum or file contents in file listing.
+            # However, when size_bytes is present, we record it.
+            remote_entries = {}
             for rf in remote_files:
-                p = rf.get("name", "")
-                if p.startswith("/workspace/"):
-                    p = p[len("/workspace/"):]
-                remote_paths.add(p)
+                # Path resolution: prefer 'path' without 'workspace/', fallback to 'name'
+                r_path = rf.get("path", "")
+                if r_path.startswith("workspace/"):
+                    p = r_path[len("workspace/"):]
+                elif r_path.startswith("/workspace/"):
+                    p = r_path[len("/workspace/"):]
+                else:
+                    p = rf.get("name", "")
+                    if p.startswith("/workspace/"):
+                        p = p[len("/workspace/"):]
+                    elif p.startswith("workspace/"):
+                        p = p[len("workspace/"):]
+                
+                # Normalize path separators
+                p = os.path.normpath(p)
+                size = None
+                if "size_bytes" in rf:
+                    try:
+                        size = int(rf["size_bytes"])
+                    except (ValueError, TypeError):
+                        pass
+                remote_entries[p] = {
+                    "size": size,
+                    "sha256": rf.get("sha256") or rf.get("checksum"),  # None if API does not provide hash
+                    "raw": rf
+                }
 
             conflicts = []
-            for rel_path in manifest.files.keys():
-                if rel_path in remote_paths:
-                    conflicts.append(rel_path)
+            for rel_path, local_info in manifest.files.items():
+                norm_rel = os.path.normpath(rel_path)
+                if norm_rel in remote_entries:
+                    remote_meta = remote_entries[norm_rel]
+                    # Case B & C:
+                    # If API provides SHA256 checksum: compare sha256
+                    if remote_meta.get("sha256"):
+                        if remote_meta["sha256"].lower() != local_info["sha256"].lower():
+                            conflicts.append(rel_path)
+                    else:
+                        # Antigravity API does NOT provide SHA256/checksum in workspace file listings.
+                        # Fail-safe path-existence conflict semantics:
+                        # Existing remote path is treated as CONFLICT unless overwrite=True.
+                        conflicts.append(rel_path)
 
             return conflicts, None, None
         except Exception as e:
