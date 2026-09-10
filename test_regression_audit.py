@@ -1,3 +1,5 @@
+import requests
+from unittest import mock
 import os
 import shutil
 import tempfile
@@ -243,3 +245,95 @@ class TestRegressionAudit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestP4HTTPClassificationAudit(unittest.TestCase):
+    """Specific regression suite covering P4 HTTP classification Cases A through G."""
+
+    def setUp(self):
+        self.ws = WorkspaceSync(key_index=1)
+        self.dummy_manifest = SourceManifest(
+            source_type="local",
+            source_path="/dummy",
+            files={"test.txt": {"content": b"hello", "size": 5, "sha256": "dummy"}}
+        )
+
+    def test_p4_case_a_json_environment_not_found(self):
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 404
+        mock_resp.json.return_value = {
+            "error": {
+                "code": "not_found",
+                "message": "Environment 'env-foo' not found."
+            }
+        }
+        mock_resp.text = '{"error":{"code":"not_found","message":"Environment \'env-foo\' not found."}}'
+
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-foo", self.dummy_manifest)
+            self.assertEqual(err_type, "ENVIRONMENT_NOT_FOUND")
+            self.assertIn("env-foo", err_msg)
+
+    def test_p4_case_b_json_subresource_workspace_not_found(self):
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 404
+        mock_resp.json.return_value = {
+            "error": {
+                "code": "not_found",
+                "message": "Workspace not found."
+            }
+        }
+        mock_resp.text = '{"error":{"code":"not_found","message":"Workspace not found."}}'
+
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-bar", self.dummy_manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, [])
+
+    def test_p4_case_c_non_json_404_body_fallback(self):
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 404
+        mock_resp.json.side_effect = ValueError("Invalid JSON")
+        mock_resp.text = "Environment 'env-c' not found in cluster."
+
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-c", self.dummy_manifest)
+            self.assertEqual(err_type, "ENVIRONMENT_NOT_FOUND")
+
+        # And safe fallback when random text
+        mock_resp.text = "404 Not Found HTML Page"
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-c", self.dummy_manifest)
+            self.assertIsNone(err_type)
+            self.assertEqual(conflicts, [])
+
+    def test_p4_case_d_status_400(self):
+        mock_resp = mock.Mock()
+        mock_resp.status_code = 400
+        mock_resp.text = "Bad request"
+        with mock.patch("requests.get", return_value=mock_resp):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-d", self.dummy_manifest)
+            self.assertEqual(err_type, "ENVIRONMENT_NOT_FOUND")
+
+    def test_p4_case_e_status_401_403(self):
+        for code in [401, 403]:
+            mock_resp = mock.Mock()
+            mock_resp.status_code = code
+            mock_resp.text = "Auth error"
+            with mock.patch("requests.get", return_value=mock_resp):
+                conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-e", self.dummy_manifest)
+                self.assertEqual(err_type, "UNKNOWN_CANNOT_VERIFY")
+
+    def test_p4_case_f_status_5xx_and_others(self):
+        for code in [409, 429, 500, 502, 503]:
+            mock_resp = mock.Mock()
+            mock_resp.status_code = code
+            mock_resp.text = f"Error {code}"
+            with mock.patch("requests.get", return_value=mock_resp):
+                conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-f", self.dummy_manifest)
+                self.assertEqual(err_type, "UNKNOWN_CANNOT_VERIFY")
+
+    def test_p4_case_g_timeout_and_network_error(self):
+        with mock.patch("requests.get", side_effect=requests.exceptions.Timeout("Connection timed out")):
+            conflicts, err_type, err_msg = self.ws.check_remote_conflicts("env-g", self.dummy_manifest)
+            self.assertEqual(err_type, "UNKNOWN_CANNOT_VERIFY")
+            self.assertIn("timed out", err_msg)

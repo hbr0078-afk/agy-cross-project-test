@@ -189,10 +189,29 @@ class WorkspaceSync:
             res = requests.get(url, headers=headers, timeout=30)
             if res.status_code == 404:
                 # Distinguish if environment itself is not found vs empty directory
-                err_text = res.text.lower()
-                if f"environment '{clean_env_id}' not found" in err_text or "environment not found" in err_text:
+                err_code = None
+                err_msg = ""
+                try:
+                    err_json = res.json()
+                    err_obj = err_json.get("error", {})
+                    if isinstance(err_obj, dict):
+                        err_code = str(err_obj.get("code", "")).lower()
+                        err_msg = str(err_obj.get("message", "")).lower()
+                    elif isinstance(err_obj, str):
+                        err_msg = err_obj.lower()
+                except Exception:
+                    pass
+
+                # Fallback to text inspection if JSON parsing yielded no message
+                raw_text = (err_msg or res.text or "").lower()
+                env_not_found_patterns = [
+                    f"environment '{clean_env_id}' not found",
+                    "environment not found",
+                    f"environment {clean_env_id} not found",
+                ]
+                if any(p in raw_text for p in env_not_found_patterns):
                     return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found."
-                # If path 'workspace' not found, it means workspace folder is empty/clean
+                # If path 'workspace' or other subresource not found, it means workspace folder is empty/clean
                 return [], None, None
             if res.status_code == 400:
                 return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found or invalid."
