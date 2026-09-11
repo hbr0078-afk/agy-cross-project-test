@@ -150,8 +150,10 @@ class KeyPoolManager:
             re.compile(r"^AGY_KEY_(\d+)$"),
             re.compile(r"^GEMINI_API_KEY_(\d+)$"),
         ]
+        has_env_key = False
         if "GEMINI_API_KEY" in os.environ and os.environ["GEMINI_API_KEY"].strip():
             indices.add(1)
+            has_env_key = True
 
         for k, v in os.environ.items():
             if not v or not v.strip():
@@ -160,23 +162,25 @@ class KeyPoolManager:
                 m = pat.match(k)
                 if m:
                     indices.add(int(m.group(1)))
+                    has_env_key = True
 
-        # 2. Inspect ~/.bashrc directly
-        bashrc_path = os.path.expanduser("~/.bashrc")
-        if os.path.exists(bashrc_path):
-            with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("export GEMINI_API_KEY="):
-                        val = line.split("=", 1)[1].strip("\"' ")
-                        if val:
-                            indices.add(1)
-                    for pat in [re.compile(r"^export\s+AGY_KEY_(\d+)="), re.compile(r"^export\s+GEMINI_API_KEY_(\d+)=")]:
-                        m = pat.match(line)
-                        if m:
+        # 2. Inspect ~/.bashrc directly only if no keys found in environment
+        if not has_env_key:
+            bashrc_path = os.path.expanduser("~/.bashrc")
+            if os.path.exists(bashrc_path):
+                with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("export GEMINI_API_KEY="):
                             val = line.split("=", 1)[1].strip("\"' ")
                             if val:
-                                indices.add(int(m.group(1)))
+                                indices.add(1)
+                        for pat in [re.compile(r"^export\s+AGY_KEY_(\d+)="), re.compile(r"^export\s+GEMINI_API_KEY_(\d+)=")]:
+                            m = pat.match(line)
+                            if m:
+                                val = line.split("=", 1)[1].strip("\"' ")
+                                if val:
+                                    indices.add(int(m.group(1)))
 
         # Ensure that discovered indices actually yield a non-empty key
         valid_indices = []
