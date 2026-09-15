@@ -1,15 +1,25 @@
 import json
 import requests
 from typing import Dict, Any, Optional
+from keys import KeyPoolManager, AllKeysExhaustedError, get_api_key_by_index
 
 API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 AGENT_NAME = "antigravity-preview-05-2026"
 
 class AntigravityClient:
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError("API key must not be empty.")
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        key_pool: Optional[KeyPoolManager] = None,
+    ):
+        if not api_key and key_pool is None:
+            raise ValueError("Either api_key or key_pool must be provided.")
         self._api_key = api_key
+        self._key_pool = key_pool
+
+    @property
+    def is_pool_mode(self) -> bool:
+        return self._key_pool is not None
 
     def create_interaction(
         self,
@@ -21,10 +31,40 @@ class AntigravityClient:
     ) -> Dict[str, Any]:
         """
         Creates an interaction with Antigravity Agent.
+        In single-key mode: executes a direct request with the fixed API key.
+        In key-pool mode: automatically acquires an active key, handles retries/rollovers
+        on 429/401/403/5xx/network errors, updates key states, and returns the result.
         """
+        if not self.is_pool_mode:
+            return self._execute_request(
+                api_key=self._api_key,
+                prompt=prompt,
+                environment=environment,
+                environment_id=environment_id,
+                previous_interaction_id=previous_interaction_id,
+                timeout=timeout,
+            )
+
+        return self._create_interaction_with_pool(
+            prompt=prompt,
+            environment=environment,
+            environment_id=environment_id,
+            previous_interaction_id=previous_interaction_id,
+            timeout=timeout,
+        )
+
+    def _execute_request(
+        self,
+        api_key: str,
+        prompt: str,
+        environment: str,
+        environment_id: Optional[str],
+        previous_interaction_id: Optional[str],
+        timeout: int,
+    ) -> Dict[str, Any]:
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-key": self._api_key,
+            "x-goog-api-key": api_key,
         }
         payload: Dict[str, Any] = {
             "agent": AGENT_NAME,
@@ -36,8 +76,15 @@ class AntigravityClient:
         if previous_interaction_id:
             payload["previous_interaction_id"] = previous_interaction_id
 
-        response = requests.post(API_BASE_URL, headers=headers, json=payload, timeout=timeout)
-        
+        try:
+            response = requests.post(API_BASE_URL, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            return {
+                "success": False,
+                "status_code": None,
+                "error": {"network_error": str(e)},
+            }
+
         if response.status_code != 200:
             error_data = {}
             try:
@@ -51,7 +98,7 @@ class AntigravityClient:
             }
 
         res_json = response.json()
-        
+
         # Parse output safely
         output_text = ""
         if res_json.get("output"):
@@ -74,4 +121,129 @@ class AntigravityClient:
             "usage": res_json.get("usage", {}),
             "output": output_text.strip(),
             "raw": res_json,
+        }
+
+    def _create_interaction_with_pool(
+        self,
+        prompt: str,
+        environment: str,
+        environment_id: Optional[str],
+        previous_interaction_id: Optional[str],
+        timeout: int,
+    ) -> Dict[str, Any]:
+        """
+        Manages key-pool lifecycle:
+        - Acquires an active key from KeyPoolManager
+        - Reports outcome to KeyPoolManager (200, 429, 401, 403, 5xx, timeout/network)
+        - Retries on same key once for 5xx / network errors
+        - Rotates to next available key on 429, 401, 403, and exhausted 5xx/network errors
+        - Immediately stops on 4xx client errors (400, 404, etc.) without rotation
+        - Stops if all keys are exhausted (raises AllKeysExhaustedError) or retry limit reached
+        """
+        discovered_keys = self._key_pool.discover_keys()
+        total_keys = len(discovered_keys) if discovered_keys else 1
+        # Safe retry bound: allow up to total_keys rotations, with 1 retry per key for transient errors
+        max_attempts = max(total_keys * 2, 4)
+
+        tried_keys = set()
+        same_key_retried = set()
+        excluded_keys = set()
+        attempts = 0
+        last_result = None
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                data = self._key_pool.get_status()
+                candidates = [
+                    k for k, v in data.items()
+                    if v.get("state") == "ACTIVE" and k not in excluded_keys
+                ]
+                prefer = candidates[0] if candidates else None
+                key_ref, key_idx = self._key_pool.acquire_key(prefer_key=prefer)
+            except AllKeysExhaustedError:
+                if last_result is not None:
+                    return last_result
+                raise
+
+            tried_keys.add(key_ref)
+            raw_key = get_api_key_by_index(key_idx)
+            if not raw_key:
+                # Key index found in discovery but raw key not readable -> mark INACTIVE
+                self._key_pool.report_result(key_ref, status_code=401)
+                excluded_keys.add(key_ref)
+                continue
+
+            result = self._execute_request(
+                api_key=raw_key,
+                prompt=prompt,
+                environment=environment,
+                environment_id=environment_id,
+                previous_interaction_id=previous_interaction_id,
+                timeout=timeout,
+            )
+            result["key_ref"] = key_ref
+            result["key_index"] = key_idx
+            last_result = result
+
+            status_code = result.get("status_code")
+
+            # 1. Success (200)
+            if result.get("success") and status_code == 200:
+                self._key_pool.report_result(key_ref, status_code=200)
+                return result
+
+            # 2. Client error (400, 404, etc. excluding 401, 403, 429) -> Do NOT rotate
+            if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):
+                self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
+                return result
+
+            # 3. 429 (Rate limit) -> Cooldown & Rotate to next key immediately
+            if status_code == 429:
+                self._key_pool.report_result(key_ref, status_code=429, error_data=result.get("error"))
+                excluded_keys.add(key_ref)
+                continue
+
+            # 4. 401 (Invalid auth) -> Inactive & Rotate to next key immediately
+            if status_code == 401:
+                self._key_pool.report_result(key_ref, status_code=401, error_data=result.get("error"))
+                excluded_keys.add(key_ref)
+                continue
+
+            # 5. 403 (Forbidden) -> Record failure via report_result & Rotate to next key
+            if status_code == 403:
+                self._key_pool.report_result(key_ref, status_code=403, error_data=result.get("error"))
+                excluded_keys.add(key_ref)
+                continue
+
+            # 6. 5xx (Server error) -> Retry same key once, then rotate
+            if status_code is not None and status_code in (500, 502, 503, 504):
+                if key_ref not in same_key_retried:
+                    same_key_retried.add(key_ref)
+                    # Retry same key once without switching
+                    continue
+                # Already retried same key once -> report to pool and rotate
+                self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
+                excluded_keys.add(key_ref)
+                continue
+
+            # 7. Network / Timeout error (status_code is None or 0) -> Retry same key once, then rotate
+            if status_code is None or status_code == 0:
+                if key_ref not in same_key_retried:
+                    same_key_retried.add(key_ref)
+                    # Retry same key once without switching
+                    continue
+                # Already retried same key once -> report to pool and rotate
+                self._key_pool.report_result(key_ref, status_code=None, error_data=result.get("error"))
+                excluded_keys.add(key_ref)
+                continue
+
+            # Default fallback for unhandled codes
+            self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
+            excluded_keys.add(key_ref)
+
+        return last_result if last_result is not None else {
+            "success": False,
+            "status_code": None,
+            "error": {"error": "Maximum rollover attempts reached"},
         }
