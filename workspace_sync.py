@@ -9,8 +9,8 @@ import shutil
 import requests
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
-from keys import get_api_key_by_index
+from typing import Optional, List, Dict, Any, Tuple
+from keys import KeyPoolManager, AllKeysExhaustedError, get_api_key_by_index
 from git_manager import GitManager
 from client import AntigravityClient
 
@@ -63,8 +63,17 @@ class SyncResult:
     error_message: Optional[str] = None
 
 class WorkspaceSync:
-    def __init__(self, key_index: int = 1):
+    def __init__(
+        self,
+        key_index: int = 1,
+        key_pool: Optional[KeyPoolManager] = None,
+    ):
         self.key_index = key_index
+        self.key_pool = key_pool
+
+    @property
+    def is_pool_mode(self) -> bool:
+        return self.key_pool is not None
 
     def _is_safe_rel_path(self, rel_path: str) -> bool:
         if not rel_path or os.path.isabs(rel_path):
@@ -168,6 +177,114 @@ class WorkspaceSync:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _execute_conflict_check_request(
+        self,
+        clean_env_id: str,
+        api_key: str,
+        timeout: int = 30
+    ) -> tuple[int, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Executes raw GET request for workspace files.
+        Returns (status_code, response_json_or_None, error_text_or_None).
+        """
+        url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_env_id}/files/workspace"
+        headers = {"x-goog-api-key": api_key}
+        try:
+            res = requests.get(url, headers=headers, timeout=timeout)
+            status_code = res.status_code
+            if status_code == 200:
+                try:
+                    return status_code, res.json(), None
+                except Exception as e:
+                    return status_code, None, str(e)
+            else:
+                err_text = ""
+                try:
+                    err_json = res.json()
+                    err_obj = err_json.get("error", {})
+                    if isinstance(err_obj, dict):
+                        err_text = str(err_obj.get("message", ""))
+                    elif isinstance(err_obj, str):
+                        err_text = err_obj
+                except Exception:
+                    err_text = res.text[:200]
+                return status_code, None, err_text or res.text[:200]
+        except requests.exceptions.RequestException as e:
+            return 0, None, str(e)
+
+    def _parse_conflict_data(
+        self,
+        clean_env_id: str,
+        manifest: SourceManifest,
+        status_code: int,
+        data: Optional[Dict[str, Any]],
+        err_text: Optional[str]
+    ) -> tuple[List[str], Optional[str], Optional[str]]:
+        """
+        Translates raw HTTP response to conflict tuple: (conflicts, err_type, err_msg)
+        """
+        if status_code == 404:
+            raw_text = (err_text or "").lower()
+            env_not_found_patterns = [
+                f"environment '{clean_env_id}' not found",
+                "environment not found",
+                f"environment {clean_env_id} not found",
+            ]
+            if any(p in raw_text for p in env_not_found_patterns):
+                return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found."
+            # If path 'workspace' not found, workspace is empty/clean
+            return [], None, None
+
+        if status_code == 400:
+            return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found or invalid."
+
+        if status_code in (401, 403):
+            return [], "UNKNOWN_CANNOT_VERIFY", f"Authentication failed when checking remote conflicts (HTTP {status_code})."
+
+        if status_code != 200 or data is None:
+            return [], "UNKNOWN_CANNOT_VERIFY", f"Cannot verify remote conflicts: HTTP {status_code}: {err_text or ''}"
+
+        remote_files = data.get("files", [])
+        remote_entries = {}
+        for rf in remote_files:
+            r_path = rf.get("path", "")
+            if r_path.startswith("workspace/"):
+                p = r_path[len("workspace/"):]
+            elif r_path.startswith("/workspace/"):
+                p = r_path[len("/workspace/"):]
+            else:
+                p = rf.get("name", "")
+                if p.startswith("/workspace/"):
+                    p = p[len("/workspace/"):]
+                elif p.startswith("workspace/"):
+                    p = p[len("workspace/"):]
+
+            p = os.path.normpath(p)
+            size = None
+            if "size_bytes" in rf:
+                try:
+                    size = int(rf["size_bytes"])
+                except (ValueError, TypeError):
+                    pass
+            remote_entries[p] = {
+                "size": size,
+                "sha256": rf.get("sha256") or rf.get("checksum"),
+                "raw": rf
+            }
+
+        conflicts = []
+        for rel_path, local_info in manifest.files.items():
+            norm_rel = os.path.normpath(rel_path)
+            if norm_rel in remote_entries:
+                remote_meta = remote_entries[norm_rel]
+                if remote_meta.get("sha256"):
+                    if remote_meta["sha256"].lower() != local_info["sha256"].lower():
+                        conflicts.append(rel_path)
+                else:
+                    conflicts.append(rel_path)
+
+        return conflicts, None, None
+
     def check_remote_conflicts(self, environment_id: str, manifest: SourceManifest) -> tuple[List[str], Optional[str], Optional[str]]:
         """
         Check remote workspace for conflicts.
@@ -178,102 +295,105 @@ class WorkspaceSync:
         - API failure / auth error: ([], "UNKNOWN_CANNOT_VERIFY", msg)
         """
         clean_env_id = environment_id.replace("environment-", "")
-        api_key = get_api_key_by_index(self.key_index)
-        if not api_key:
-            return [], "NO_API_KEY", f"No API key available for index {self.key_index}."
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_env_id}/files/workspace"
-        headers = {"x-goog-api-key": api_key}
+        # 1. Single-key legacy mode
+        if not self.is_pool_mode:
+            api_key = get_api_key_by_index(self.key_index)
+            if not api_key:
+                return [], "NO_API_KEY", f"No API key available for index {self.key_index}."
 
-        try:
-            res = requests.get(url, headers=headers, timeout=30)
-            if res.status_code == 404:
-                # Distinguish if environment itself is not found vs empty directory
-                err_code = None
-                err_msg = ""
-                try:
-                    err_json = res.json()
-                    err_obj = err_json.get("error", {})
-                    if isinstance(err_obj, dict):
-                        err_code = str(err_obj.get("code", "")).lower()
-                        err_msg = str(err_obj.get("message", "")).lower()
-                    elif isinstance(err_obj, str):
-                        err_msg = err_obj.lower()
-                except Exception:
-                    pass
+            status_code, data, err_text = self._execute_conflict_check_request(clean_env_id, api_key)
+            return self._parse_conflict_data(clean_env_id, manifest, status_code, data, err_text)
 
-                # Fallback to text inspection if JSON parsing yielded no message
-                raw_text = (err_msg or res.text or "").lower()
-                env_not_found_patterns = [
-                    f"environment '{clean_env_id}' not found",
-                    "environment not found",
-                    f"environment {clean_env_id} not found",
+        # 2. KeyPool mode with rollover
+        assert self.key_pool is not None
+        discovered_keys = self.key_pool.discover_keys()
+        total_keys = len(discovered_keys) if discovered_keys else 1
+        max_attempts = max(total_keys * 2, 4)
+
+        tried_keys = set()
+        same_key_retried = set()
+        excluded_keys = set()
+        attempts = 0
+        last_parsed = None
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                data_status = self.key_pool.get_status()
+                candidates = [
+                    k for k, v in data_status.items()
+                    if v.get("state") == "ACTIVE" and k not in excluded_keys
                 ]
-                if any(p in raw_text for p in env_not_found_patterns):
-                    return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found."
-                # If path 'workspace' or other subresource not found, it means workspace folder is empty/clean
-                return [], None, None
-            if res.status_code == 400:
-                return [], "ENVIRONMENT_NOT_FOUND", f"ENVIRONMENT_NOT_FOUND: Environment '{clean_env_id}' not found or invalid."
-            if res.status_code in (401, 403):
-                return [], "UNKNOWN_CANNOT_VERIFY", f"Authentication failed when checking remote conflicts (HTTP {res.status_code})."
-            if res.status_code != 200:
-                return [], "UNKNOWN_CANNOT_VERIFY", f"Cannot verify remote conflicts: HTTP {res.status_code}: {res.text[:100]}"
+                prefer = candidates[0] if candidates else None
+                key_ref, key_idx = self.key_pool.acquire_key(prefer_key=prefer)
+            except AllKeysExhaustedError:
+                raise
 
-            data = res.json()
-            remote_files = data.get("files", [])
-            # Map of remote relative path -> remote metadata
-            # Antigravity files API returns: name, path, type, size_bytes, mime_type, created, modified
-            # Notice: The API does NOT return file SHA256/checksum or file contents in file listing.
-            # However, when size_bytes is present, we record it.
-            remote_entries = {}
-            for rf in remote_files:
-                # Path resolution: prefer 'path' without 'workspace/', fallback to 'name'
-                r_path = rf.get("path", "")
-                if r_path.startswith("workspace/"):
-                    p = r_path[len("workspace/"):]
-                elif r_path.startswith("/workspace/"):
-                    p = r_path[len("/workspace/"):]
-                else:
-                    p = rf.get("name", "")
-                    if p.startswith("/workspace/"):
-                        p = p[len("/workspace/"):]
-                    elif p.startswith("workspace/"):
-                        p = p[len("workspace/"):]
-                
-                # Normalize path separators
-                p = os.path.normpath(p)
-                size = None
-                if "size_bytes" in rf:
-                    try:
-                        size = int(rf["size_bytes"])
-                    except (ValueError, TypeError):
-                        pass
-                remote_entries[p] = {
-                    "size": size,
-                    "sha256": rf.get("sha256") or rf.get("checksum"),  # None if API does not provide hash
-                    "raw": rf
-                }
+            tried_keys.add(key_ref)
+            raw_key = get_api_key_by_index(key_idx)
+            if not raw_key:
+                self.key_pool.report_result(key_ref, status_code=401)
+                excluded_keys.add(key_ref)
+                continue
 
-            conflicts = []
-            for rel_path, local_info in manifest.files.items():
-                norm_rel = os.path.normpath(rel_path)
-                if norm_rel in remote_entries:
-                    remote_meta = remote_entries[norm_rel]
-                    # Case B & C:
-                    # If API provides SHA256 checksum: compare sha256
-                    if remote_meta.get("sha256"):
-                        if remote_meta["sha256"].lower() != local_info["sha256"].lower():
-                            conflicts.append(rel_path)
-                    else:
-                        # Antigravity API does NOT provide SHA256/checksum in workspace file listings.
-                        # Fail-safe path-existence conflict semantics:
-                        # Existing remote path is treated as CONFLICT unless overwrite=True.
-                        conflicts.append(rel_path)
+            status_code, res_json, err_text = self._execute_conflict_check_request(clean_env_id, raw_key)
+            parsed_result = self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
+            last_parsed = parsed_result
 
-            return conflicts, None, None
-        except Exception as e:
-            return [], "UNKNOWN_CANNOT_VERIFY", mask_credentials(f"Error checking remote environment: {str(e)}")
+            # Success (200)
+            if status_code == 200:
+                self.key_pool.report_result(key_ref, status_code=200)
+                return parsed_result
+
+            # 400 / 404 (Client errors or environment/resource state) -> Do NOT rotate key
+            if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):
+                self.key_pool.report_result(key_ref, status_code=status_code)
+                return parsed_result
+
+            # 429 -> Cooldown & rotate
+            if status_code == 429:
+                self.key_pool.report_result(key_ref, status_code=429)
+                excluded_keys.add(key_ref)
+                continue
+
+            # 401 -> Inactive & rotate
+            if status_code == 401:
+                self.key_pool.report_result(key_ref, status_code=401)
+                excluded_keys.add(key_ref)
+                continue
+
+            # 403 -> Report & rotate
+            if status_code == 403:
+                self.key_pool.report_result(key_ref, status_code=403)
+                excluded_keys.add(key_ref)
+                continue
+
+            # 5xx -> Retry same key once, then rotate
+            if status_code is not None and status_code in (500, 502, 503, 504):
+                if key_ref not in same_key_retried:
+                    same_key_retried.add(key_ref)
+                    continue
+                self.key_pool.report_result(key_ref, status_code=status_code)
+                excluded_keys.add(key_ref)
+                continue
+
+            # Network / Timeout (status_code == 0 or None) -> Retry same key once, then rotate
+            if status_code == 0 or status_code is None:
+                if key_ref not in same_key_retried:
+                    same_key_retried.add(key_ref)
+                    continue
+                self.key_pool.report_result(key_ref, status_code=None)
+                excluded_keys.add(key_ref)
+                continue
+
+            # Default fallback
+            self.key_pool.report_result(key_ref, status_code=status_code)
+            excluded_keys.add(key_ref)
+
+        if last_parsed is not None:
+            return last_parsed
+        return [], "UNKNOWN_CANNOT_VERIFY", "Conflict check failed: maximum attempts reached"
 
     def sync_to_remote(
         self,
@@ -299,14 +419,6 @@ class WorkspaceSync:
                     error_message=f"INVALID_PATH: Path traversal attempt detected in path '{rel_path}'."
                 )
 
-        api_key = get_api_key_by_index(self.key_index)
-        if not api_key:
-            return SyncResult(
-                status=SyncStatus.ERROR,
-                environment_id=clean_env_id,
-                error_message=f"No API key available for index {self.key_index}."
-            )
-
         # 2. Check payload size limits (Fail-fast)
         if manifest.total_size > MAX_TOTAL_PAYLOAD_BYTES:
             return SyncResult(
@@ -324,7 +436,11 @@ class WorkspaceSync:
                 )
 
         # 3. Remote conflict check with fail-safe unpacking
-        conflict_res = self.check_remote_conflicts(clean_env_id, manifest)
+        try:
+            conflict_res = self.check_remote_conflicts(clean_env_id, manifest)
+        except AllKeysExhaustedError:
+            raise
+
         if len(conflict_res) == 2:
             conflicts, err_msg = conflict_res
             err_type = "ERROR" if err_msg else None
@@ -385,12 +501,27 @@ class WorkspaceSync:
             f"Execute it and print the output exactly."
         )
 
-        client = AntigravityClient(api_key=api_key)
-        res = client.create_interaction(
-            prompt=prompt,
-            environment="remote",
-            environment_id=clean_env_id
-        )
+        # 5. Initialize client: single key or key pool mode
+        if self.is_pool_mode:
+            client = AntigravityClient(key_pool=self.key_pool)
+        else:
+            api_key = get_api_key_by_index(self.key_index)
+            if not api_key:
+                return SyncResult(
+                    status=SyncStatus.ERROR,
+                    environment_id=clean_env_id,
+                    error_message=f"No API key available for index {self.key_index}."
+                )
+            client = AntigravityClient(api_key=api_key)
+
+        try:
+            res = client.create_interaction(
+                prompt=prompt,
+                environment="remote",
+                environment_id=clean_env_id
+            )
+        except AllKeysExhaustedError:
+            raise
 
         if not res.get("success"):
             status_code = res.get("status_code", 0)
