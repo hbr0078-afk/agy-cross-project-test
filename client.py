@@ -11,11 +11,15 @@ class AntigravityClient:
         self,
         api_key: Optional[str] = None,
         key_pool: Optional[KeyPoolManager] = None,
+        project_id: Optional[str] = None,
+        registry: Optional[Any] = None,
     ):
         if not api_key and key_pool is None:
             raise ValueError("Either api_key or key_pool must be provided.")
         self._api_key = api_key
         self._key_pool = key_pool
+        self.project_id = project_id
+        self.registry = registry
 
     @property
     def is_pool_mode(self) -> bool:
@@ -28,6 +32,7 @@ class AntigravityClient:
         environment_id: Optional[str] = None,
         previous_interaction_id: Optional[str] = None,
         timeout: int = 120,
+        project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Creates an interaction with Antigravity Agent.
@@ -35,6 +40,8 @@ class AntigravityClient:
         In key-pool mode: automatically acquires an active key, handles retries/rollovers
         on 429/401/403/5xx/network errors, updates key states, and returns the result.
         """
+        target_project_id = project_id or self.project_id
+
         if not self.is_pool_mode:
             return self._execute_request(
                 api_key=self._api_key,
@@ -51,6 +58,7 @@ class AntigravityClient:
             environment_id=environment_id,
             previous_interaction_id=previous_interaction_id,
             timeout=timeout,
+            project_id=target_project_id,
         )
 
     def _execute_request(
@@ -130,6 +138,7 @@ class AntigravityClient:
         environment_id: Optional[str],
         previous_interaction_id: Optional[str],
         timeout: int,
+        project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Manages key-pool lifecycle:
@@ -154,13 +163,40 @@ class AntigravityClient:
         while attempts < max_attempts:
             attempts += 1
             try:
-                data = self._key_pool.get_status()
-                candidates = [
-                    k for k, v in data.items()
-                    if v.get("state") == "ACTIVE" and k not in excluded_keys
-                ]
-                prefer = candidates[0] if candidates else None
-                key_ref, key_idx = self._key_pool.acquire_key(prefer_key=prefer)
+                # Prioritize project_id's active_key from registry if project_id is provided
+                prefer_candidate = None
+                if project_id and self.registry:
+                    try:
+                        p = self.registry.get_project(project_id)
+                        if p and p.get("active_key") and p["active_key"] not in excluded_keys:
+                            prefer_candidate = p["active_key"]
+                    except Exception:
+                        pass
+
+                if not prefer_candidate:
+                    data = self._key_pool.get_status()
+                    candidates = [
+                        k for k, v in data.items()
+                        if v.get("state") == "ACTIVE" and k not in excluded_keys
+                    ]
+                    prefer_candidate = candidates[0] if candidates else None
+
+                key_ref, key_idx = self._key_pool.acquire_key(
+                    prefer_key=prefer_candidate,
+                    project_id=project_id,
+                    registry=self.registry
+                )
+
+                if key_ref in excluded_keys:
+                    # If acquired key was previously excluded during this transaction, acquire next available
+                    data = self._key_pool.get_status()
+                    candidates = [
+                        k for k, v in data.items()
+                        if v.get("state") == "ACTIVE" and k not in excluded_keys
+                    ]
+                    if not candidates:
+                        raise AllKeysExhaustedError("All non-excluded active keys exhausted.")
+                    key_ref, key_idx = self._key_pool.acquire_key(prefer_key=candidates[0])
             except AllKeysExhaustedError:
                 if last_result is not None:
                     return last_result
@@ -191,6 +227,17 @@ class AntigravityClient:
             # 1. Success (200)
             if result.get("success") and status_code == 200:
                 self._key_pool.report_result(key_ref, status_code=200)
+                # Sticky Binding: update registry active_key on successful interaction
+                if project_id and self.registry:
+                    try:
+                        self.registry.update_project_state(
+                            project_id=project_id,
+                            active_key=key_ref,
+                            environment_id=result.get("environment_id"),
+                            last_interaction_id=result.get("interaction_id")
+                        )
+                    except Exception:
+                        pass
                 return result
 
             # 2. Client error (400, 404, etc. excluding 401, 403, 429) -> Do NOT rotate

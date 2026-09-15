@@ -211,13 +211,19 @@ class KeyPoolManager:
                 keys_dict[ref]["index"] = idx
         return data
 
-    def acquire_key(self, prefer_key: Optional[str] = None) -> Tuple[str, int]:
+    def acquire_key(
+        self,
+        prefer_key: Optional[str] = None,
+        project_id: Optional[str] = None,
+        registry: Optional[Any] = None
+    ) -> Tuple[str, int]:
         """
         Acquires an available ACTIVE key reference and its 1-based index under lock.
         Checks and recovers expired COOLDOWN states.
         Selects based on:
         1. prefer_key if specified and currently eligible
-        2. Least-recently-used (lowest last_used_at) eligible key
+        2. Project's active_key from registry if project_id is specified
+        3. Least-recently-used (lowest last_used_at) eligible key
         Returns (key_ref, key_index).
         Raises AllKeysExhaustedError if no keys are eligible.
         """
@@ -244,10 +250,28 @@ class KeyPoolManager:
                 raise AllKeysExhaustedError("All API keys in the pool are exhausted (INACTIVE or in COOLDOWN).")
 
             chosen_ref = None
+            
+            # 1. Check prefer_key
             if prefer_key and prefer_key in eligible:
                 chosen_ref = prefer_key
-            else:
-                # Least-recently-used selection
+                
+            # 2. Check project binding
+            if not chosen_ref and project_id:
+                try:
+                    reg = registry
+                    if reg is None:
+                        from registry import ProjectRegistry
+                        reg = ProjectRegistry()
+                    p = reg.get_project(project_id)
+                    if p:
+                        proj_key = p.get("active_key")
+                        if proj_key in eligible:
+                            chosen_ref = proj_key
+                except Exception:
+                    pass
+
+            # 3. Least-recently-used selection
+            if not chosen_ref:
                 eligible.sort(key=lambda r: keys_dict[r].get("last_used_at", 0))
                 chosen_ref = eligible[0]
 

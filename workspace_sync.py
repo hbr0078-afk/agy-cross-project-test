@@ -67,9 +67,13 @@ class WorkspaceSync:
         self,
         key_index: int = 1,
         key_pool: Optional[KeyPoolManager] = None,
+        project_id: Optional[str] = None,
+        registry: Optional[Any] = None,
     ):
         self.key_index = key_index
         self.key_pool = key_pool
+        self.project_id = project_id
+        self.registry = registry
 
     @property
     def is_pool_mode(self) -> bool:
@@ -320,13 +324,29 @@ class WorkspaceSync:
         while attempts < max_attempts:
             attempts += 1
             try:
-                data_status = self.key_pool.get_status()
-                candidates = [
-                    k for k, v in data_status.items()
-                    if v.get("state") == "ACTIVE" and k not in excluded_keys
-                ]
-                prefer = candidates[0] if candidates else None
-                key_ref, key_idx = self.key_pool.acquire_key(prefer_key=prefer)
+                # Prioritize project active key if available and not excluded
+                prefer_candidate = None
+                if self.project_id and self.registry:
+                    try:
+                        p = self.registry.get_project(self.project_id)
+                        if p and p.get("active_key") and p["active_key"] not in excluded_keys:
+                            prefer_candidate = p["active_key"]
+                    except Exception:
+                        pass
+
+                if not prefer_candidate:
+                    data_status = self.key_pool.get_status()
+                    candidates = [
+                        k for k, v in data_status.items()
+                        if v.get("state") == "ACTIVE" and k not in excluded_keys
+                    ]
+                    prefer_candidate = candidates[0] if candidates else None
+
+                key_ref, key_idx = self.key_pool.acquire_key(
+                    prefer_key=prefer_candidate,
+                    project_id=self.project_id,
+                    registry=self.registry
+                )
             except AllKeysExhaustedError:
                 raise
 
@@ -344,6 +364,14 @@ class WorkspaceSync:
             # Success (200)
             if status_code == 200:
                 self.key_pool.report_result(key_ref, status_code=200)
+                if self.project_id and self.registry:
+                    try:
+                        self.registry.update_project_state(
+                            project_id=self.project_id,
+                            active_key=key_ref
+                        )
+                    except Exception:
+                        pass
                 return parsed_result
 
             # 400 / 404 (Client errors or environment/resource state) -> Do NOT rotate key
@@ -503,7 +531,11 @@ class WorkspaceSync:
 
         # 5. Initialize client: single key or key pool mode
         if self.is_pool_mode:
-            client = AntigravityClient(key_pool=self.key_pool)
+            client = AntigravityClient(
+                key_pool=self.key_pool,
+                project_id=self.project_id,
+                registry=self.registry
+            )
         else:
             api_key = get_api_key_by_index(self.key_index)
             if not api_key:
