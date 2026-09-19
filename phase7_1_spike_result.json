@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-09-19T13:50:00Z",
+  "endpoint": "https://generativelanguage.googleapis.com/v1beta",
+  "agent_compatibility": {
+    "antigravity-preview-05-2026": "ACCEPTED (200 OK)",
+    "antigravity-preview-09-2026": "ACCEPTED (200 OK)"
+  },
+  "key_mapping": {
+    "key1": "project-A (Google AI Studio Project 1)",
+    "key2": "project-B (Google AI Studio Project 2)"
+  },
+  "tests": [
+    {
+      "test": "test_1_baseline_interaction_key1",
+      "key_ref": "key1",
+      "http_status": 200,
+      "success": true,
+      "environment_id": "bdf4fedca8f6f327ecaf3acda02435d2",
+      "interaction_id": "v1_Chd2NUd1YW9hOEdZSE5yZmNQZ0syU3lRSRIXdjVHdWFvYThHWUhOcmZjUGdLMlN5UUk",
+      "semantic_result": "BASELINE_CREATED"
+    },
+    {
+      "test": "test_2_same_key_continuation_key1",
+      "key_ref": "key1",
+      "http_status": 200,
+      "success": true,
+      "previous_interaction_id_used": true,
+      "semantic_result": "CONTEXT_PRESERVED (Token SPIKE_TOKEN_7A91 recalled)"
+    },
+    {
+      "test": "test_3_cross_project_key2_with_env_a_and_int_a",
+      "key_ref": "key2",
+      "http_status": 404,
+      "success": false,
+      "error_code": "not_found",
+      "error_message": "Requested entity was not found.",
+      "semantic_result": "ISOLATION_ENFORCED"
+    },
+    {
+      "test": "test_4_cross_project_key2_with_env_a_only",
+      "key_ref": "key2",
+      "http_status": 404,
+      "success": false,
+      "error_code": "not_found",
+      "error_message": "Requested entity was not found.",
+      "semantic_result": "ISOLATION_ENFORCED"
+    },
+    {
+      "test": "test_7_direct_environments_api_check",
+      "key1_status": 200,
+      "key2_status": 404,
+      "error_message": "Requested entity was not found.",
+      "semantic_result": "ENVIRONMENT_TENANT_LOCKED"
+    },
+    {
+      "test": "test_8_baseline_interaction_key2",
+      "key_ref": "key2",
+      "http_status": 200,
+      "success": true,
+      "environment_id": "8206f9dfd63b389fd6daa396c62400ed",
+      "interaction_id": "v1_ChctcEd1YXZtZEFzS2o5dE1QblpHWG1ROBIXLXBHdWF2bWRBc0tqOXRNUG5aR1htUTg",
+      "semantic_result": "BASELINE_CREATED"
+    },
+    {
+      "test": "test_8_2_same_key_continuation_key2",
+      "key_ref": "key2",
+      "http_status": 200,
+      "success": true,
+      "previous_interaction_id_used": true,
+      "semantic_result": "CONTEXT_PRESERVED (Token SPIKE_KEY2_TOKEN_8821 recalled)"
+    },
+    {
+      "test": "test_15_environment_files_api_check",
+      "key1_status": 200,
+      "key2_status": 404,
+      "error_message": "Environment 'bdf4fedca8f6f327ecaf3acda02435d2' not found.",
+      "semantic_result": "FILE_STORE_TENANT_LOCKED"
+    }
+  ]
+}
