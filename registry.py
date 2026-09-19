@@ -2,24 +2,27 @@ import os
 import json
 import tempfile
 import fcntl
+import time
 import subprocess
 from typing import Dict, Any, Optional, List
 
 DEFAULT_REGISTRY_DIR = os.path.expanduser("~/.agy-router")
-DEFAULT_REGISTRY_PATH = os.path.join(DEFAULT_REGISTRY_DIR, "registry.json")
+DEFAULT_REGISTRY_PATH = os.path.join(DEFAULT_REGISTRY_DIR, "projects.json")
 
 class RegistryCorruptedError(Exception):
     """Raised when the registry file is corrupted and cannot be safely parsed."""
     pass
 
 class ProjectRegistry:
-    def __init__(self, storage_path: str = DEFAULT_REGISTRY_PATH):
+    def __init__(self, storage_path: str = DEFAULT_REGISTRY_PATH, sessions_path: Optional[str] = None):
         self.storage_path = os.path.abspath(storage_path)
         self.storage_dir = os.path.dirname(self.storage_path)
         self.lock_path = self.storage_path + ".lock"
+        self.sessions_path = os.path.abspath(sessions_path) if sessions_path else os.path.join(self.storage_dir, "sessions.json")
         self._lock_depth = 0
         self._lock_fd = None
         self._ensure_storage_dir()
+        self._check_and_migrate_legacy_registry()
 
     def _ensure_storage_dir(self):
         if self.storage_dir and not os.path.exists(self.storage_dir):
@@ -28,6 +31,100 @@ class ProjectRegistry:
                 os.chmod(self.storage_dir, 0o700)
             except OSError:
                 pass
+
+    def _check_and_migrate_legacy_registry(self):
+        """
+        Migrates legacy registry.json to projects.json and sessions.json if needed.
+        Idempotent: reads legacy registry.json, extracts static project metadata into projects.json,
+        and converts runtime state (active_key, environment_id, last_interaction_id) into default session records in sessions.json.
+        """
+        legacy_path = os.path.join(self.storage_dir, "registry.json")
+        if not os.path.exists(legacy_path):
+            return
+
+        def _migrate():
+            if not os.path.exists(legacy_path):
+                return
+
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if not content:
+                        return
+                    legacy_data = json.loads(content)
+            except Exception as e:
+                # Corrupted registry fail-safe: do not overwrite/corrupt target storage
+                raise RegistryCorruptedError(
+                    f"Legacy registry at '{legacy_path}' is corrupted: {e}"
+                ) from e
+
+            projects_dict = legacy_data.get("projects", {})
+            if not isinstance(projects_dict, dict):
+                return
+
+            # Load or initialize projects.json data
+            data = self.load()
+            existing_projects = data.get("projects", {})
+
+            # Load or initialize sessions.json data
+            from sessions import SessionStateManager
+            sess_mgr = SessionStateManager(storage_path=self.sessions_path)
+            try:
+                sess_data = sess_mgr.load()
+            except Exception:
+                sess_data = {"sessions": {}}
+
+            changed_projects = False
+            changed_sessions = False
+
+            for pid, entry in projects_dict.items():
+                if not isinstance(entry, dict):
+                    continue
+
+                # 1. Static project metadata -> projects.json
+                if pid not in existing_projects:
+                    proj_record = {
+                        "project_id": pid,
+                        "path": entry.get("path", ""),
+                        "repo": entry.get("repo", ""),
+                        "branch": entry.get("branch", "main"),
+                        "last_commit": entry.get("last_commit", ""),
+                        "state": entry.get("state", "IDLE"),
+                        "roadmap": entry.get("roadmap", "ROADMAP.md")
+                    }
+                    existing_projects[pid] = proj_record
+                    changed_projects = True
+
+                # 2. Runtime state -> sessions.json default session
+                sid = f"sess_{pid}_default"
+                if sid not in sess_data.get("sessions", {}):
+                    active_key = entry.get("active_key", "key1")
+                    env_id = entry.get("environment_id", "")
+                    last_int_id = entry.get("last_interaction_id", "")
+
+                    if active_key or env_id or last_int_id:
+                        sess_record = {
+                            "session_id": sid,
+                            "project_id": pid,
+                            "bound_key": active_key or "key1",
+                            "tenant_id": "",
+                            "environment_id": env_id or "",
+                            "last_interaction_id": last_int_id or "",
+                            "state": "ACTIVE" if env_id or last_int_id else "IDLE",
+                            "created_at": time.time(),
+                            "updated_at": time.time()
+                        }
+                        sess_data.setdefault("sessions", {})[sid] = sess_record
+                        changed_sessions = True
+
+            if changed_projects:
+                data["projects"] = existing_projects
+                self.save(data)
+
+            if changed_sessions:
+                sess_mgr.save(sess_data)
+
+        self._with_lock(_migrate)
 
     def _with_lock(self, func):
         """Re-entrant file lock wrapper using POSIX advisory lock."""

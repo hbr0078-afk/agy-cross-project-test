@@ -34,7 +34,7 @@ class TestPhase7_2Concurrency(unittest.TestCase):
                     session_id=sid,
                     environment_id=f"env_{worker_id}",
                     last_interaction_id=f"int_{worker_id}_{step}",
-                    state="BUSY" if step < 4 else "ACTIVE"
+                    state="ACTIVE"
                 )
             return True
 

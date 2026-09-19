@@ -265,19 +265,8 @@ class AntigravityClient:
             # 1. Success (200)
             if result.get("success") and status_code == 200:
                 self._key_pool.report_result(key_ref, status_code=200)
-                # Sticky Binding: update registry active_key on successful interaction
-                if project_id and self.registry:
-                    try:
-                        self.registry.update_project_state(
-                            project_id=project_id,
-                            active_key=key_ref,
-                            environment_id=result.get("environment_id"),
-                            last_interaction_id=result.get("interaction_id")
-                        )
-                    except Exception:
-                        pass
-                # Update SessionStateManager if active
                 if session_id and self.session_manager:
+                    # Session mode: update runtime state ONLY in SessionStateManager
                     try:
                         self.session_manager.update_session(
                             session_id=session_id,
@@ -288,6 +277,18 @@ class AntigravityClient:
                         )
                     except Exception:
                         pass
+                else:
+                    # Non-session mode: update project active_key in registry if project_id is provided
+                    if project_id and self.registry:
+                        try:
+                            self.registry.update_project_state(
+                                project_id=project_id,
+                                active_key=key_ref,
+                                environment_id=result.get("environment_id"),
+                                last_interaction_id=result.get("interaction_id")
+                            )
+                        except Exception:
+                            pass
                 return result
 
             # 2. Client error (400, 404, etc. excluding 401, 403, 429) -> Do NOT rotate

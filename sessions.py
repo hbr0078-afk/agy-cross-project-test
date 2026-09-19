@@ -18,7 +18,7 @@ class SessionStateManager:
     Decoupled from static Project metadata (projects.json) and Key pool (key_states.json).
     Ensures safe multi-session isolation, process-level atomic flock, and state transitions.
     """
-    VALID_STATES = {"IDLE", "BUSY", "ACTIVE", "INVALIDATED"}
+    VALID_STATES = {"IDLE", "ACTIVE", "INVALIDATED"}
 
     def __init__(self, storage_path: str = DEFAULT_SESSION_PATH):
         self.storage_path = os.path.abspath(storage_path)
