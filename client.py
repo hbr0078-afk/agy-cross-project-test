@@ -13,6 +13,7 @@ class AntigravityClient:
         key_pool: Optional[KeyPoolManager] = None,
         project_id: Optional[str] = None,
         registry: Optional[Any] = None,
+        session_manager: Optional[Any] = None,
     ):
         if not api_key and key_pool is None:
             raise ValueError("Either api_key or key_pool must be provided.")
@@ -20,6 +21,7 @@ class AntigravityClient:
         self._key_pool = key_pool
         self.project_id = project_id
         self.registry = registry
+        self.session_manager = session_manager
 
     @property
     def is_pool_mode(self) -> bool:
@@ -33,32 +35,67 @@ class AntigravityClient:
         previous_interaction_id: Optional[str] = None,
         timeout: int = 120,
         project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Creates an interaction with Antigravity Agent.
         In single-key mode: executes a direct request with the fixed API key.
         In key-pool mode: automatically acquires an active key, handles retries/rollovers
         on 429/401/403/5xx/network errors, updates key states, and returns the result.
+        Supports session_id isolation via SessionStateManager.
         """
         target_project_id = project_id or self.project_id
 
+        # Resolve session state if session_id or session_manager provided
+        resolved_env_id = environment_id
+        resolved_prev_id = previous_interaction_id
+        target_session = None
+
+        if self.session_manager and (session_id or target_project_id):
+            sid = session_id or (f"sess_{target_project_id}" if target_project_id else None)
+            if sid:
+                target_session = self.session_manager.get_session(sid)
+                if not target_session and target_project_id:
+                    target_session = self.session_manager.create_session(
+                        project_id=target_project_id,
+                        session_id=sid,
+                        environment_id=environment_id
+                    )
+                if target_session:
+                    if not resolved_env_id and target_session.get("environment_id"):
+                        resolved_env_id = target_session["environment_id"]
+                    if not resolved_prev_id and target_session.get("last_interaction_id"):
+                        resolved_prev_id = target_session["last_interaction_id"]
+
         if not self.is_pool_mode:
-            return self._execute_request(
+            res = self._execute_request(
                 api_key=self._api_key,
                 prompt=prompt,
                 environment=environment,
-                environment_id=environment_id,
-                previous_interaction_id=previous_interaction_id,
+                environment_id=resolved_env_id,
+                previous_interaction_id=resolved_prev_id,
                 timeout=timeout,
             )
+            if res.get("success") and target_session and self.session_manager:
+                try:
+                    self.session_manager.update_session(
+                        session_id=target_session["session_id"],
+                        environment_id=res.get("environment_id"),
+                        last_interaction_id=res.get("interaction_id"),
+                        state="ACTIVE"
+                    )
+                except Exception:
+                    pass
+            return res
 
         return self._create_interaction_with_pool(
             prompt=prompt,
             environment=environment,
-            environment_id=environment_id,
-            previous_interaction_id=previous_interaction_id,
+            environment_id=resolved_env_id,
+            previous_interaction_id=resolved_prev_id,
             timeout=timeout,
             project_id=target_project_id,
+            session_id=target_session.get("session_id") if target_session else session_id,
         )
 
     def _execute_request(
@@ -139,6 +176,7 @@ class AntigravityClient:
         previous_interaction_id: Optional[str],
         timeout: int,
         project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Manages key-pool lifecycle:
@@ -235,6 +273,18 @@ class AntigravityClient:
                             active_key=key_ref,
                             environment_id=result.get("environment_id"),
                             last_interaction_id=result.get("interaction_id")
+                        )
+                    except Exception:
+                        pass
+                # Update SessionStateManager if active
+                if session_id and self.session_manager:
+                    try:
+                        self.session_manager.update_session(
+                            session_id=session_id,
+                            bound_key=key_ref,
+                            environment_id=result.get("environment_id"),
+                            last_interaction_id=result.get("interaction_id"),
+                            state="ACTIVE"
                         )
                     except Exception:
                         pass
