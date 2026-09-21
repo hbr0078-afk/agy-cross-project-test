@@ -271,5 +271,24 @@ for i in range(10):
         sessions = mgr.list_sessions()
         self.assertEqual(len(sessions), 50)
 
+    # -------------------------------------------------------------------------
+    # Test 9: Same-thread nested acquisition across DIFFERENT FileAndThreadLock instances
+    # -------------------------------------------------------------------------
+    def test_09_same_thread_nested_different_wrapper_instances(self):
+        lock_path = os.path.join(self.test_dir.name, "nested.lock")
+        lock1 = FileAndThreadLock(lock_path)
+        lock2 = FileAndThreadLock(lock_path)
+        lock3 = FileAndThreadLock(lock_path)
+
+        executed = []
+        with lock1:
+            executed.append("outer")
+            with lock2:
+                executed.append("middle")
+                with lock3:
+                    executed.append("inner")
+
+        self.assertEqual(executed, ["outer", "middle", "inner"])
+
 if __name__ == "__main__":
     unittest.main()
