@@ -170,5 +170,99 @@ class TestMigrationAndSourceOfTruth(unittest.TestCase):
         inv = sess_mgr.invalidate_session("sess_atomic")
         self.assertEqual(inv["state"], "INVALIDATED")
 
+    def test_05_new_project_schema_has_no_runtime_fields(self):
+        # Verify that register_project() produces a schema WITHOUT runtime state
+        reg = ProjectRegistry(storage_path=self.projects_path, sessions_path=self.sessions_path)
+        project_dir = os.path.join(self.test_dir, "proj_schema_clean")
+        os.makedirs(project_dir, exist_ok=True)
+        proj = reg.register_project(project_path=project_dir, project_id="proj_schema_clean")
+
+        # Static fields must be present
+        self.assertIn("project_id", proj)
+        self.assertIn("path", proj)
+        self.assertIn("repo", proj)
+        self.assertIn("branch", proj)
+        self.assertIn("last_commit", proj)
+        self.assertIn("state", proj)
+        self.assertIn("roadmap", proj)
+
+        # Runtime session fields MUST NOT be present in projects.json schema
+        self.assertNotIn("active_key", proj)
+        self.assertNotIn("environment_id", proj)
+        self.assertNotIn("last_interaction_id", proj)
+
+        # Also inspect raw JSON stored on disk
+        with open(self.projects_path, "r", encoding="utf-8") as f:
+            disk_data = json.load(f)
+        disk_proj = disk_data["projects"]["proj_schema_clean"]
+        self.assertNotIn("active_key", disk_proj)
+        self.assertNotIn("environment_id", disk_proj)
+        self.assertNotIn("last_interaction_id", disk_proj)
+
+    def test_06_complete_separation_of_three_storages(self):
+        # Ensure projects.json, sessions.json, and key_states.json have strict responsibility separation
+        reg = ProjectRegistry(storage_path=self.projects_path, sessions_path=self.sessions_path)
+        sess_mgr = SessionStateManager(storage_path=self.sessions_path)
+        key_mgr = KeyPoolManager(storage_path=self.keys_path)
+
+        project_dir = os.path.join(self.test_dir, "proj_tri")
+        os.makedirs(project_dir, exist_ok=True)
+        reg.register_project(project_path=project_dir, project_id="proj_tri")
+
+        sess = sess_mgr.create_session("proj_tri", session_id="sess_tri_1", bound_key="key1")
+        sess_mgr.update_session("sess_tri_1", environment_id="env_tri", last_interaction_id="int_tri", state="ACTIVE")
+        key_mgr.report_result("key1", status_code=200)
+
+        # 1. projects.json: Only static project info
+        with open(self.projects_path, "r") as f:
+            p_data = json.load(f)
+        self.assertNotIn("env_tri", json.dumps(p_data))
+        self.assertNotIn("int_tri", json.dumps(p_data))
+
+        # 2. sessions.json: Runtime session info, no key health metrics
+        with open(self.sessions_path, "r") as f:
+            s_data = json.load(f)
+        self.assertIn("env_tri", json.dumps(s_data))
+        self.assertIn("int_tri", json.dumps(s_data))
+        self.assertNotIn("cooldown_until", json.dumps(s_data))
+
+        # 3. key_states.json: Key health only, no environment_id or project_id
+        with open(self.keys_path, "r") as f:
+            k_data = json.load(f)
+        self.assertIn("key1", k_data.get("keys", {}))
+        self.assertNotIn("proj_tri", json.dumps(k_data))
+        self.assertNotIn("env_tri", json.dumps(k_data))
+
+    def test_07_repeated_register_does_not_reintroduce_runtime_fields(self):
+        # Test 2: repeated register does not reintroduce runtime fields
+        reg = ProjectRegistry(storage_path=self.projects_path, sessions_path=self.sessions_path)
+        project_dir = os.path.join(self.test_dir, "proj_repeat")
+        os.makedirs(project_dir, exist_ok=True)
+
+        # First registration
+        p1 = reg.register_project(project_path=project_dir, project_id="proj_repeat")
+        self.assertNotIn("active_key", p1)
+        self.assertNotIn("environment_id", p1)
+        self.assertNotIn("last_interaction_id", p1)
+
+        # Second registration (re-register)
+        p2 = reg.register_project(project_path=project_dir, project_id="proj_repeat")
+        self.assertNotIn("active_key", p2)
+        self.assertNotIn("environment_id", p2)
+        self.assertNotIn("last_interaction_id", p2)
+
+        # Even if someone directly injected legacy fields into disk, re-register strips them
+        with open(self.projects_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["projects"]["proj_repeat"]["active_key"] = "key1"
+        data["projects"]["proj_repeat"]["environment_id"] = "env_legacy"
+        with open(self.projects_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        p3 = reg.register_project(project_path=project_dir, project_id="proj_repeat")
+        self.assertNotIn("active_key", p3)
+        self.assertNotIn("environment_id", p3)
+        self.assertNotIn("last_interaction_id", p3)
+
 if __name__ == "__main__":
     unittest.main()

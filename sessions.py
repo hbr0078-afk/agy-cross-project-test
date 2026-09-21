@@ -4,6 +4,8 @@ import tempfile
 import fcntl
 import time
 from typing import Dict, Any, Optional, List
+from file_lock import FileAndThreadLock
+
 
 DEFAULT_SESSION_DIR = os.path.expanduser("~/.agy-router")
 DEFAULT_SESSION_PATH = os.path.join(DEFAULT_SESSION_DIR, "sessions.json")
@@ -24,8 +26,7 @@ class SessionStateManager:
         self.storage_path = os.path.abspath(storage_path)
         self.storage_dir = os.path.dirname(self.storage_path)
         self.lock_path = self.storage_path + ".lock"
-        self._lock_depth = 0
-        self._lock_fd = None
+        self._lock = FileAndThreadLock(self.lock_path)
         self._ensure_storage_dir()
 
     def _ensure_storage_dir(self):
@@ -37,25 +38,9 @@ class SessionStateManager:
                 pass
 
     def _with_lock(self, func):
-        """Re-entrant file lock wrapper using POSIX advisory lock."""
+        """Re-entrant file and thread lock wrapper."""
         self._ensure_storage_dir()
-        if self._lock_depth > 0:
-            return func()
-
-        self._lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
-            self._lock_depth += 1
-            return func()
-        finally:
-            self._lock_depth -= 1
-            if self._lock_depth == 0 and self._lock_fd is not None:
-                try:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(self._lock_fd)
-                self._lock_fd = None
+        return self._lock.run(func)
 
     def load(self) -> Dict[str, Any]:
         def _read():

@@ -5,6 +5,8 @@ import fcntl
 import time
 import subprocess
 from typing import Dict, Any, Optional, List
+from file_lock import FileAndThreadLock
+
 
 DEFAULT_REGISTRY_DIR = os.path.expanduser("~/.agy-router")
 DEFAULT_REGISTRY_PATH = os.path.join(DEFAULT_REGISTRY_DIR, "projects.json")
@@ -19,8 +21,7 @@ class ProjectRegistry:
         self.storage_dir = os.path.dirname(self.storage_path)
         self.lock_path = self.storage_path + ".lock"
         self.sessions_path = os.path.abspath(sessions_path) if sessions_path else os.path.join(self.storage_dir, "sessions.json")
-        self._lock_depth = 0
-        self._lock_fd = None
+        self._lock = FileAndThreadLock(self.lock_path)
         self._ensure_storage_dir()
         self._check_and_migrate_legacy_registry()
 
@@ -127,25 +128,9 @@ class ProjectRegistry:
         self._with_lock(_migrate)
 
     def _with_lock(self, func):
-        """Re-entrant file lock wrapper using POSIX advisory lock."""
+        """Re-entrant file and thread lock wrapper."""
         self._ensure_storage_dir()
-        if self._lock_depth > 0:
-            return func()
-
-        self._lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
-            self._lock_depth += 1
-            return func()
-        finally:
-            self._lock_depth -= 1
-            if self._lock_depth == 0 and self._lock_fd is not None:
-                try:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(self._lock_fd)
-                self._lock_fd = None
+        return self._lock.run(func)
 
     def load(self) -> Dict[str, Any]:
         def _read():
@@ -229,9 +214,6 @@ class ProjectRegistry:
                 "path": abs_path,
                 "repo": repo or existing.get("repo", ""),
                 "branch": branch or existing.get("branch", "main"),
-                "active_key": existing.get("active_key", "key1"),
-                "environment_id": existing.get("environment_id", ""),
-                "last_interaction_id": existing.get("last_interaction_id", ""),
                 "last_commit": last_commit or existing.get("last_commit", ""),
                 "state": existing.get("state", "IDLE"),
                 "roadmap": existing.get("roadmap", "ROADMAP.md")

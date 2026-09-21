@@ -83,7 +83,8 @@ class TestProjectRegistry(unittest.TestCase):
             raw_text = f.read()
         self.assertNotIn("AIza", raw_text)
         self.assertNotIn("key_value", raw_text)
-        self.assertIn("active_key", raw_text) # Only key reference
+        # Note: In Phase 7-2, runtime fields including active_key are no longer stored in projects.json
+        self.assertNotIn("active_key", raw_text)
 
 if __name__ == "__main__":
     unittest.main()

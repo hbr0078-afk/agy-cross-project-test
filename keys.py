@@ -5,6 +5,8 @@ import time
 import fcntl
 import tempfile
 from typing import Dict, Any, Optional, List, Tuple
+from file_lock import FileAndThreadLock
+
 
 DEFAULT_KEY_STORAGE_DIR = os.path.expanduser("~/.agy-router")
 DEFAULT_KEY_STATE_PATH = os.path.join(DEFAULT_KEY_STORAGE_DIR, "key_states.json")
@@ -73,8 +75,7 @@ class KeyPoolManager:
         self.storage_dir = os.path.dirname(self.storage_path)
         self.lock_path = self.storage_path + ".lock"
         self.cooldown_seconds = cooldown_seconds
-        self._lock_depth = 0
-        self._lock_fd = None
+        self._lock = FileAndThreadLock(self.lock_path)
         self._ensure_storage_dir()
 
     def _ensure_storage_dir(self):
@@ -86,25 +87,9 @@ class KeyPoolManager:
                 pass
 
     def _with_lock(self, func):
-        """Re-entrant file lock wrapper using POSIX advisory lock."""
+        """Re-entrant file and thread lock wrapper."""
         self._ensure_storage_dir()
-        if self._lock_depth > 0:
-            return func()
-
-        self._lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
-            self._lock_depth += 1
-            return func()
-        finally:
-            self._lock_depth -= 1
-            if self._lock_depth == 0 and self._lock_fd is not None:
-                try:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(self._lock_fd)
-                self._lock_fd = None
+        return self._lock.run(func)
 
     def _load_raw(self) -> Dict[str, Any]:
         if not os.path.exists(self.storage_path):
