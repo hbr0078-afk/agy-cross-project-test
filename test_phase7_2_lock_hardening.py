@@ -9,7 +9,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch, MagicMock
 
-from file_lock import FileAndThreadLock, get_shared_thread_lock
+from file_lock import FileAndThreadLock, get_shared_thread_lock, get_path_lock_state
 from registry import ProjectRegistry
 from keys import KeyPoolManager
 from sessions import SessionStateManager
@@ -289,6 +289,151 @@ for i in range(10):
                     executed.append("inner")
 
         self.assertEqual(executed, ["outer", "middle", "inner"])
+
+    # -------------------------------------------------------------------------
+    # Test 10: Outer lock survives inner exit
+    # -------------------------------------------------------------------------
+    def test_10_outer_lock_survives_inner_exit(self):
+        lock_path = os.path.join(self.test_dir.name, "persistence.lock")
+        outer = FileAndThreadLock(lock_path)
+        inner = FileAndThreadLock(lock_path)
+        competing_lock = FileAndThreadLock(lock_path)
+
+        lock_acquired_by_competitor = threading.Event()
+        competitor_finished = threading.Event()
+
+        def competitor():
+            with competing_lock:
+                lock_acquired_by_competitor.set()
+            competitor_finished.set()
+
+        with outer:
+            with inner:
+                pass
+            
+            # Inner exited, outer still held.
+            # Start competitor thread. It should be blocked.
+            t = threading.Thread(target=competitor)
+            t.start()
+            
+            # Wait a bit to ensure it would have acquired if it could
+            time.sleep(0.2)
+            self.assertFalse(lock_acquired_by_competitor.is_set(), "Competitor acquired lock while outer still held it")
+
+        # Now outer exited, competitor should proceed
+        t.join(timeout=2)
+        self.assertTrue(lock_acquired_by_competitor.is_set(), "Competitor failed to acquire lock after outer exit")
+
+    # -------------------------------------------------------------------------
+    # Test 11: Nested exception safety
+    # -------------------------------------------------------------------------
+    def test_11_nested_exception_safety(self):
+        lock_path = os.path.join(self.test_dir.name, "exception.lock")
+        outer = FileAndThreadLock(lock_path)
+        inner = FileAndThreadLock(lock_path)
+        
+        competing_lock = FileAndThreadLock(lock_path)
+        lock_acquired_by_competitor = threading.Event()
+
+        def competitor():
+            with competing_lock:
+                lock_acquired_by_competitor.set()
+
+        try:
+            with outer:
+                try:
+                    with inner:
+                        raise ValueError("inner crash")
+                except ValueError as e:
+                    self.assertEqual(str(e), "inner crash")
+                    
+                    # Verify outer still holds the lock even after inner exception
+                    t = threading.Thread(target=competitor)
+                    t.start()
+                    time.sleep(0.2)
+                    self.assertFalse(lock_acquired_by_competitor.is_set(), "Competitor acquired lock after inner crash but during outer scope")
+                    
+                # Continue outer scope
+        except Exception as e:
+            self.fail(f"Outer scope caught unexpected exception: {e}")
+
+        # After outer scope exits, competitor should be able to acquire
+        time.sleep(0.3)
+        self.assertTrue(lock_acquired_by_competitor.is_set(), "Competitor failed to acquire lock after outer exit following exception")
+
+    # -------------------------------------------------------------------------
+    # Test 12: Different path independence
+    # -------------------------------------------------------------------------
+    def test_12_different_path_independence(self):
+        path_a = os.path.join(self.test_dir.name, "a.lock")
+        path_b = os.path.join(self.test_dir.name, "b.lock")
+        
+        lock_a = FileAndThreadLock(path_a)
+        lock_b = FileAndThreadLock(path_b)
+        
+        a_held = threading.Event()
+        b_held = threading.Event()
+        release_a = threading.Event()
+        release_b = threading.Event()
+
+        def worker_a():
+            with lock_a:
+                a_held.set()
+                release_a.wait()
+
+        def worker_b():
+            with lock_b:
+                b_held.set()
+                release_b.wait()
+
+        t1 = threading.Thread(target=worker_a)
+        t2 = threading.Thread(target=worker_b)
+        
+        t1.start()
+        t2.start()
+        
+        # Verify both can hold locks simultaneously
+        self.assertTrue(a_held.wait(timeout=2))
+        self.assertTrue(b_held.wait(timeout=2))
+        
+        release_a.set()
+        release_b.set()
+        t1.join()
+        t2.join()
+
+    # -------------------------------------------------------------------------
+    # Test 13: Nested depth balance
+    # -------------------------------------------------------------------------
+    def test_13_nested_depth_balance(self):
+        lock_path = os.path.join(self.test_dir.name, "depth.lock")
+        w1 = FileAndThreadLock(lock_path)
+        w2 = FileAndThreadLock(lock_path)
+        w3 = FileAndThreadLock(lock_path)
+        
+        state = get_path_lock_state(lock_path)
+        
+        with w1:
+            self.assertEqual(getattr(state.local, "depth", 0), 1)
+            fd1 = getattr(state.local, "fd", None)
+            self.assertIsNotNone(fd1)
+            
+            with w2:
+                self.assertEqual(getattr(state.local, "depth", 0), 2)
+                self.assertEqual(getattr(state.local, "fd", None), fd1)
+                
+                with w3:
+                    self.assertEqual(getattr(state.local, "depth", 0), 3)
+            
+            self.assertEqual(getattr(state.local, "depth", 0), 1)
+            self.assertEqual(getattr(state.local, "fd", None), fd1)
+            
+        self.assertEqual(getattr(state.local, "depth", 0), 0)
+        self.assertIsNone(getattr(state.local, "fd", None))
+        
+        # Verify it can be re-acquired
+        with w1:
+            self.assertEqual(getattr(state.local, "depth", 0), 1)
+            self.assertIsNotNone(getattr(state.local, "fd", None))
 
 if __name__ == "__main__":
     unittest.main()
