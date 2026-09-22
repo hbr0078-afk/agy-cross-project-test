@@ -7,16 +7,26 @@ import tarfile
 import base64
 import shutil
 import requests
+import mimetypes
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from keys import KeyPoolManager, AllKeysExhaustedError, get_api_key_by_index
 from git_manager import GitManager
 from client import AntigravityClient
+from environment_files import (
+    EnvironmentFileClient, SyncPlanner, SyncAction, 
+    IntegrityVerifier, RemoteManifest, PlannedFileAction, RemoteFileInfo
+)
+from sessions import SessionStateManager
 
-# Limits for single interaction safety
-MAX_FILE_SIZE_BYTES = 512 * 1024       # 512 KB per file limit for prompt injection
-MAX_TOTAL_PAYLOAD_BYTES = 2 * 1024 * 1024 # 2 MB total payload limit
+# Transport safety limits (configurable, not claims of hard Google limits)
+DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024       # 10 MB default
+DEFAULT_MAX_TOTAL_SYNC_BYTES = 50 * 1024 * 1024      # 50 MB default
+
+# Backward compatibility alias for legacy tests
+MAX_FILE_SIZE_BYTES = DEFAULT_MAX_FILE_SIZE_BYTES
+MAX_TOTAL_PAYLOAD_BYTES = DEFAULT_MAX_TOTAL_SYNC_BYTES
 
 def mask_credentials(text: str) -> str:
     """Mask tokens, passwords, and API keys from logs/outputs."""
@@ -59,6 +69,7 @@ class SyncResult:
     synced_files: List[str] = field(default_factory=list)
     skipped_files: List[str] = field(default_factory=list)
     verified_files: List[str] = field(default_factory=list)
+    failed_files: List[str] = field(default_factory=list)
     output: str = ""
     error_message: Optional[str] = None
 
@@ -69,11 +80,19 @@ class WorkspaceSync:
         key_pool: Optional[KeyPoolManager] = None,
         project_id: Optional[str] = None,
         registry: Optional[Any] = None,
+        session_manager: Optional[SessionStateManager] = None,
+        session_id: Optional[str] = None,
+        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+        max_total_sync_bytes: int = DEFAULT_MAX_TOTAL_SYNC_BYTES,
     ):
         self.key_index = key_index
         self.key_pool = key_pool
         self.project_id = project_id
         self.registry = registry
+        self.session_manager = session_manager
+        self.session_id = session_id
+        self.max_file_size_bytes = max_file_size_bytes
+        self.max_total_sync_bytes = max_total_sync_bytes
 
     @property
     def is_pool_mode(self) -> bool:
@@ -82,10 +101,12 @@ class WorkspaceSync:
     def _is_safe_rel_path(self, rel_path: str) -> bool:
         if not rel_path or os.path.isabs(rel_path):
             return False
-        normalized = os.path.normpath(rel_path)
-        if normalized == ".." or normalized.startswith(".." + os.sep) or normalized.startswith("../") or "/../" in normalized or "\\..\\" in normalized:
+        if "\x00" in rel_path:
             return False
-        if normalized.startswith(".."):
+        normalized = os.path.normpath(rel_path).replace("\\", "/")
+        if normalized == "." or normalized == ".." or normalized.startswith("../") or "/../" in normalized or normalized.endswith("/.."):
+            return False
+        if normalized.startswith("/"):
             return False
         return True
 
@@ -188,7 +209,7 @@ class WorkspaceSync:
         timeout: int = 30
     ) -> tuple[int, Optional[Dict[str, Any]], Optional[str]]:
         """
-        Executes raw GET request for workspace files.
+        Executes raw GET request for workspace files via Environment File API.
         Returns (status_code, response_json_or_None, error_text_or_None).
         """
         url = f"https://generativelanguage.googleapis.com/v1beta/environments/{clean_env_id}/files/workspace"
@@ -224,9 +245,6 @@ class WorkspaceSync:
         data: Optional[Dict[str, Any]],
         err_text: Optional[str]
     ) -> tuple[List[str], Optional[str], Optional[str]]:
-        """
-        Translates raw HTTP response to conflict tuple: (conflicts, err_type, err_msg)
-        """
         if status_code == 404:
             raw_text = (err_text or "").lower()
             env_not_found_patterns = [
@@ -290,15 +308,7 @@ class WorkspaceSync:
         return conflicts, None, None
 
     def check_remote_conflicts(self, environment_id: str, manifest: SourceManifest) -> tuple[List[str], Optional[str], Optional[str]]:
-        """
-        Check remote workspace for conflicts.
-        Distinguishes clearly between:
-        - clean workspace: ([], None, None)
-        - actual conflicts: (conflicts, None, None)
-        - non-existent environment: ([], "ENVIRONMENT_NOT_FOUND", msg)
-        - API failure / auth error: ([], "UNKNOWN_CANNOT_VERIFY", msg)
-        """
-        clean_env_id = environment_id.replace("environment-", "")
+        clean_env_id = EnvironmentFileClient.clean_environment_id(environment_id)
 
         # 1. Single-key legacy mode
         if not self.is_pool_mode:
@@ -309,8 +319,29 @@ class WorkspaceSync:
             status_code, data, err_text = self._execute_conflict_check_request(clean_env_id, api_key)
             return self._parse_conflict_data(clean_env_id, manifest, status_code, data, err_text)
 
-        # 2. KeyPool mode with rollover
+        # 2. KeyPool mode with session safety
         assert self.key_pool is not None
+
+        # Check session bound key first
+        target_session = None
+        if self.session_manager and (self.session_id or self.project_id):
+            sid = self.session_id or (f"sess_{self.project_id}" if self.project_id else None)
+            if sid:
+                target_session = self.session_manager.get_session(sid)
+
+        if target_session and target_session.get("bound_key"):
+            bound_ref = target_session["bound_key"]
+            raw_key = None
+            m = re.match(r"key(\d+)", bound_ref)
+            if m:
+                raw_key = get_api_key_by_index(int(m.group(1)))
+            if raw_key:
+                status_code, res_json, err_text = self._execute_conflict_check_request(clean_env_id, raw_key)
+                if status_code == 200:
+                    self.key_pool.report_result(bound_ref, status_code=200)
+                return self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
+
+        # Discovered keys check
         discovered_keys = self.key_pool.discover_keys()
         total_keys = len(discovered_keys) if discovered_keys else 1
         max_attempts = max(total_keys * 2, 4)
@@ -324,7 +355,6 @@ class WorkspaceSync:
         while attempts < max_attempts:
             attempts += 1
             try:
-                # Prioritize project active key if available and not excluded
                 prefer_candidate = None
                 if self.project_id and self.registry:
                     try:
@@ -361,7 +391,6 @@ class WorkspaceSync:
             parsed_result = self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
             last_parsed = parsed_result
 
-            # Success (200)
             if status_code == 200:
                 self.key_pool.report_result(key_ref, status_code=200)
                 if self.project_id and self.registry:
@@ -374,30 +403,25 @@ class WorkspaceSync:
                         pass
                 return parsed_result
 
-            # 400 / 404 (Client errors or environment/resource state) -> Do NOT rotate key
             if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):
                 self.key_pool.report_result(key_ref, status_code=status_code)
                 return parsed_result
 
-            # 429 -> Cooldown & rotate
             if status_code == 429:
                 self.key_pool.report_result(key_ref, status_code=429)
                 excluded_keys.add(key_ref)
                 continue
 
-            # 401 -> Inactive & rotate
             if status_code == 401:
                 self.key_pool.report_result(key_ref, status_code=401)
                 excluded_keys.add(key_ref)
                 continue
 
-            # 403 -> Report & rotate
             if status_code == 403:
                 self.key_pool.report_result(key_ref, status_code=403)
                 excluded_keys.add(key_ref)
                 continue
 
-            # 5xx -> Retry same key once, then rotate
             if status_code is not None and status_code in (500, 502, 503, 504):
                 if key_ref not in same_key_retried:
                     same_key_retried.add(key_ref)
@@ -406,7 +430,6 @@ class WorkspaceSync:
                 excluded_keys.add(key_ref)
                 continue
 
-            # Network / Timeout (status_code == 0 or None) -> Retry same key once, then rotate
             if status_code == 0 or status_code is None:
                 if key_ref not in same_key_retried:
                     same_key_retried.add(key_ref)
@@ -415,13 +438,42 @@ class WorkspaceSync:
                 excluded_keys.add(key_ref)
                 continue
 
-            # Default fallback
             self.key_pool.report_result(key_ref, status_code=status_code)
             excluded_keys.add(key_ref)
 
         if last_parsed is not None:
             return last_parsed
         return [], "UNKNOWN_CANNOT_VERIFY", "Conflict check failed: maximum attempts reached"
+
+    def _resolve_effective_key(self, environment_id: str) -> tuple[Optional[str], Optional[str]]:
+        """
+        Resolves the effective API key and key reference, preserving tenant isolation.
+        Returns (raw_key, key_ref).
+        """
+        # Session mode has highest priority for tenant isolation
+        if self.session_manager and (self.session_id or self.project_id):
+            sid = self.session_id or (f"sess_{self.project_id}" if self.project_id else None)
+            if sid:
+                sess = self.session_manager.get_session(sid)
+                if sess and sess.get("bound_key"):
+                    b_ref = sess["bound_key"]
+                    m = re.match(r"key(\d+)", b_ref)
+                    if m:
+                        k = get_api_key_by_index(int(m.group(1)))
+                        if k:
+                            return k, b_ref
+
+        if not self.is_pool_mode:
+            raw = get_api_key_by_index(self.key_index)
+            return raw, f"key{self.key_index}"
+
+        # Pool mode without session
+        assert self.key_pool is not None
+        key_ref, key_idx = self.key_pool.acquire_key(
+            project_id=self.project_id,
+            registry=self.registry
+        )
+        return get_api_key_by_index(key_idx), key_ref
 
     def sync_to_remote(
         self,
@@ -430,13 +482,17 @@ class WorkspaceSync:
         overwrite: bool = False
     ) -> SyncResult:
         """
-        Synchronizes files from SourceManifest into the remote Antigravity environment.
-        - Validates paths first (fails fast on path traversal)
-        - Checks payload & file size boundaries
-        - Checks conflicts / fail-safe on unverified remote state
-        - Injects files & verifies integrity via SHA256 in single interaction
+        Direct Environment File API Synchronizer (Phase 7-3).
+        - Validates all local paths against path traversal
+        - Checks payload & file size safety limits
+        - Resolves effective key with strict tenant safety
+        - Lists remote files via EnvironmentFileClient and follows pagination
+        - Builds SyncPlan via SyncPlanner (handles exact diff and conflicts)
+        - Uploads new / modified files directly via PUT Environment File API
+        - Verifies each uploaded file's integrity (alt=media SHA256 & size check)
+        - Reports detailed SyncResult (synced, skipped, verified, failed)
         """
-        clean_env_id = environment_id.replace("environment-", "")
+        clean_env_id = EnvironmentFileClient.clean_environment_id(environment_id)
 
         # 1. Path safety check on all manifest files first (Fail-fast)
         for rel_path in manifest.files.keys():
@@ -447,28 +503,216 @@ class WorkspaceSync:
                     error_message=f"INVALID_PATH: Path traversal attempt detected in path '{rel_path}'."
                 )
 
-        # 2. Check payload size limits (Fail-fast)
-        if manifest.total_size > MAX_TOTAL_PAYLOAD_BYTES:
+        # 2. Check transport safety limits
+        if manifest.total_size > self.max_total_sync_bytes:
             return SyncResult(
                 status=SyncStatus.PAYLOAD_TOO_LARGE,
                 environment_id=clean_env_id,
-                error_message=f"Total payload size ({manifest.total_size} bytes) exceeds limit ({MAX_TOTAL_PAYLOAD_BYTES} bytes)."
+                error_message=f"Total payload size ({manifest.total_size} bytes) exceeds limit ({self.max_total_sync_bytes} bytes)."
             )
 
         for rel_path, info in manifest.files.items():
-            if info["size"] > MAX_FILE_SIZE_BYTES:
+            if info["size"] > self.max_file_size_bytes:
                 return SyncResult(
                     status=SyncStatus.FILE_TOO_LARGE,
                     environment_id=clean_env_id,
-                    error_message=f"File '{rel_path}' size ({info['size']} bytes) exceeds per-file limit ({MAX_FILE_SIZE_BYTES} bytes)."
+                    error_message=f"File '{rel_path}' size ({info['size']} bytes) exceeds per-file limit ({self.max_file_size_bytes} bytes)."
                 )
 
-        # 3. Remote conflict check with fail-safe unpacking
-        try:
-            conflict_res = self.check_remote_conflicts(clean_env_id, manifest)
-        except AllKeysExhaustedError:
-            raise
+        # 3. Resolve effective API Key
+        raw_key, key_ref = self._resolve_effective_key(clean_env_id)
+        if not raw_key:
+            return SyncResult(
+                status=SyncStatus.ERROR,
+                environment_id=clean_env_id,
+                error_message="No usable API key found to perform sync."
+            )
 
+        file_client = EnvironmentFileClient(api_key=raw_key)
+
+        # 4. List remote files with pagination & build remote manifest
+        try:
+            remote_file_list = file_client.list_all_files(clean_env_id, base_path="workspace")
+        except FileNotFoundError as e:
+            if self.is_pool_mode and self.key_pool and key_ref:
+                self.key_pool.report_result(key_ref, status_code=404)
+            return SyncResult(
+                status=SyncStatus.ENVIRONMENT_NOT_FOUND,
+                environment_id=clean_env_id,
+                error_message=mask_credentials(f"Environment '{clean_env_id}' not found: {e}")
+            )
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 500
+            if self.is_pool_mode and self.key_pool and key_ref:
+                self.key_pool.report_result(key_ref, status_code=code)
+            if code == 404:
+                return SyncResult(
+                    status=SyncStatus.ENVIRONMENT_NOT_FOUND,
+                    environment_id=clean_env_id,
+                    error_message=mask_credentials(f"Environment '{clean_env_id}' not found.")
+                )
+            if code in (401, 403):
+                return SyncResult(
+                    status=SyncStatus.UNKNOWN_CANNOT_VERIFY,
+                    environment_id=clean_env_id,
+                    error_message=mask_credentials(f"Authentication failure (HTTP {code}).")
+                )
+            return SyncResult(
+                status=SyncStatus.TRANSFER_FAILED,
+                environment_id=clean_env_id,
+                error_message=mask_credentials(f"Failed to list remote workspace files: {e}")
+            )
+        except Exception as e:
+            return SyncResult(
+                status=SyncStatus.TRANSFER_FAILED,
+                environment_id=clean_env_id,
+                error_message=mask_credentials(f"Error querying remote workspace: {e}")
+            )
+
+        # 5. Build Sync Plan
+        remote_manifest = SyncPlanner.build_remote_manifest(clean_env_id, remote_file_list, base_dir="workspace")
+        plan = SyncPlanner.plan(
+            source_manifest=manifest,
+            remote_manifest=remote_manifest,
+            file_client=file_client,
+            overwrite=overwrite
+        )
+
+        if plan.has_conflicts and not overwrite:
+            return SyncResult(
+                status=SyncStatus.CONFLICT,
+                environment_id=clean_env_id,
+                skipped_files=plan.conflicts,
+                error_message=f"CONFLICT: {len(plan.conflicts)} files already exist on remote. Set overwrite=True to overwrite."
+            )
+
+        # 6. Execute Upload Plan
+        synced_files: List[str] = []
+        skipped_files: List[str] = []
+        failed_files: List[str] = []
+        verified_files: List[str] = []
+        verifier = IntegrityVerifier(file_client)
+
+        for file_action in plan.actions:
+            rel_p = file_action.rel_path
+            if file_action.action == SyncAction.UNCHANGED:
+                skipped_files.append(rel_p)
+                continue
+            if file_action.action == SyncAction.REMOTE_ONLY:
+                continue
+
+            if file_action.action in (SyncAction.UPLOAD, SyncAction.UPDATE):
+                file_info = manifest.files.get(rel_p)
+                if not file_info:
+                    continue
+                content = file_info["content"]
+                target_remote_path = f"workspace/{rel_p}"
+
+                upload_ok = False
+                # Per-file retry policy: 5xx / timeout retry 1 time on same key
+                for attempt in range(2):
+                    try:
+                        res = file_client.upload_file(
+                            clean_env_id,
+                            target_remote_path,
+                            content,
+                            overwrite=overwrite
+                        )
+                        if isinstance(res, dict) and res.get("error") == "CONFLICT":
+                            failed_files.append(rel_p)
+                            break
+                        upload_ok = True
+                        break
+                    except requests.exceptions.HTTPError as he:
+                        status = he.response.status_code if he.response is not None else 500
+                        if status in (400, 401, 403, 404, 409):
+                            break
+                        if status in (500, 502, 503, 504) and attempt == 0:
+                            continue
+                        break
+                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                        if attempt == 0:
+                            continue
+                        break
+                    except Exception:
+                        break
+
+                if not upload_ok:
+                    failed_files.append(rel_p)
+                    continue
+
+                synced_files.append(rel_p)
+
+                # 7. Integrity Verification via alt=media download & SHA256 comparison
+                v_ok, v_err = verifier.verify_file(
+                    clean_env_id,
+                    rel_p,
+                    expected_size=file_info["size"],
+                    expected_sha256=file_info["sha256"],
+                    base_dir="workspace"
+                )
+                if v_ok:
+                    verified_files.append(rel_p)
+                else:
+                    failed_files.append(rel_p)
+
+        # 8. Determine final SyncResult status
+        if self.is_pool_mode and self.key_pool and key_ref:
+            self.key_pool.report_result(key_ref, status_code=200)
+
+        if failed_files:
+            if synced_files:
+                final_status = SyncStatus.SYNC_PARTIAL
+                err_msg = f"Partial sync failure: {len(failed_files)} files failed."
+            else:
+                final_status = SyncStatus.TRANSFER_FAILED
+                err_msg = f"Transfer failed for {len(failed_files)} files."
+            return SyncResult(
+                status=final_status,
+                environment_id=clean_env_id,
+                source_path=manifest.source_path,
+                commit_sha=manifest.commit_sha,
+                synced_files=synced_files,
+                skipped_files=skipped_files,
+                verified_files=verified_files,
+                failed_files=failed_files,
+                error_message=err_msg
+            )
+
+        return SyncResult(
+            status=SyncStatus.SYNC_SUCCESS,
+            environment_id=clean_env_id,
+            source_path=manifest.source_path,
+            commit_sha=manifest.commit_sha,
+            synced_files=synced_files,
+            skipped_files=skipped_files,
+            verified_files=verified_files,
+            failed_files=[],
+            output=f"Successfully synced and verified {len(synced_files)} files."
+        )
+
+    def sync_to_remote_legacy_interaction(
+        self,
+        environment_id: str,
+        manifest: SourceManifest,
+        overwrite: bool = False
+    ) -> SyncResult:
+        """
+        [DEPRECATED / LEGACY COMPATIBILITY]
+        Interaction-based Base64 Python script injection synchronization.
+        Preserved strictly for backward compatibility with legacy tests.
+        """
+        clean_env_id = EnvironmentFileClient.clean_environment_id(environment_id)
+
+        for rel_path in manifest.files.keys():
+            if not self._is_safe_rel_path(rel_path):
+                return SyncResult(
+                    status=SyncStatus.INVALID_PATH,
+                    environment_id=clean_env_id,
+                    error_message=f"INVALID_PATH: Path traversal attempt detected in path '{rel_path}'."
+                )
+
+        conflict_res = self.check_remote_conflicts(clean_env_id, manifest)
         if len(conflict_res) == 2:
             conflicts, err_msg = conflict_res
             err_type = "ERROR" if err_msg else None
@@ -496,7 +740,6 @@ class WorkspaceSync:
                 error_message=f"CONFLICT: {len(conflicts)} files already exist on remote. Set overwrite=True to overwrite."
             )
 
-        # 4. Construct payload for single interaction injection & verification
         python_unpack_lines = [
             "import os, base64, hashlib",
             "os.makedirs('/workspace', exist_ok=True)",
@@ -529,7 +772,6 @@ class WorkspaceSync:
             f"Execute it and print the output exactly."
         )
 
-        # 5. Initialize client: single key or key pool mode
         if self.is_pool_mode:
             client = AntigravityClient(
                 key_pool=self.key_pool,
@@ -546,14 +788,11 @@ class WorkspaceSync:
                 )
             client = AntigravityClient(api_key=api_key)
 
-        try:
-            res = client.create_interaction(
-                prompt=prompt,
-                environment="remote",
-                environment_id=clean_env_id
-            )
-        except AllKeysExhaustedError:
-            raise
+        res = client.create_interaction(
+            prompt=prompt,
+            environment="remote",
+            environment_id=clean_env_id
+        )
 
         if not res.get("success"):
             status_code = res.get("status_code", 0)
@@ -593,11 +832,8 @@ class WorkspaceSync:
 
     def parse_and_verify_integrity(self, report_text: str, manifest: SourceManifest) -> Dict[str, Any]:
         """
-        Strictly parses structured integrity report:
-        ---INTEGRITY_REPORT_START---
-        FILE:<rel_path>|SIZE:<size>|SHA256:<sha256>
-        ---INTEGRITY_REPORT_END---
-        Verifies exact relative path, file size, and sha256. Fails on spoofed/extra/missing data.
+        [DEPRECATED / LEGACY COMPATIBILITY HELPER]
+        Strictly parses structured integrity report from legacy agent interaction output.
         """
         if not report_text:
             return {"verified": False, "verified_files": [], "error_message": "Empty integrity report"}
@@ -627,7 +863,6 @@ class WorkspaceSync:
                 return {"verified": False, "verified_files": [], "error_message": f"Duplicate file reported in integrity report: '{r_path}'"}
             reported_files[r_path] = {"size": r_size, "sha256": r_sha}
 
-        # Ensure no extra unexpected files
         for r_path in reported_files.keys():
             if r_path not in manifest.files:
                 return {
