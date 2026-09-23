@@ -7,6 +7,8 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 
+DEFAULT_UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB configurable chunk size
+
 class SyncAction(Enum):
     UNCHANGED = "UNCHANGED"
     UPLOAD = "UPLOAD"
@@ -99,13 +101,13 @@ class EnvironmentFileClient:
         clean_id = self.clean_environment_id(environment_id)
         url = f"{self.base_url}/{clean_id}/files"
         params: Dict[str, Any] = {
-            "pageSize": page_size,
+            "page_size": page_size,
             "recursive": str(recursive).lower()
         }
         if path:
             params["path"] = path
         if page_token:
-            params["pageToken"] = page_token
+            params["page_token"] = page_token
 
         res = self.session.get(url, params=params, timeout=self.timeout)
         if res.status_code == 404:
@@ -141,9 +143,12 @@ class EnvironmentFileClient:
                     except (ValueError, TypeError):
                         pass
 
+                raw_type = (rf.get("type") or "FILE").upper()
+                entry_type = "DIRECTORY" if raw_type in ("DIRECTORY", "DIR") else "FILE"
+
                 files.append(RemoteFileInfo(
                     path=p,
-                    type=rf.get("type", "FILE"),
+                    type=entry_type,
                     size_bytes=size,
                     mime_type=rf.get("mime_type"),
                     created=rf.get("created"),
@@ -177,9 +182,12 @@ class EnvironmentFileClient:
             except (ValueError, TypeError):
                 pass
 
+        raw_type = (rf.get("type") or "FILE").upper()
+        entry_type = "DIRECTORY" if raw_type in ("DIRECTORY", "DIR") else "FILE"
+
         return RemoteFileInfo(
             path=rf.get("path") or rf.get("name") or path,
-            type=rf.get("type", "FILE"),
+            type=entry_type,
             size_bytes=size,
             mime_type=rf.get("mime_type"),
             created=rf.get("created"),
@@ -203,29 +211,73 @@ class EnvironmentFileClient:
         path: str,
         content: bytes,
         mime_type: Optional[str] = None,
-        overwrite: bool = False
+        overwrite: bool = False,
+        chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
     ) -> Dict[str, Any]:
         clean_id = self.clean_environment_id(environment_id)
         encoded_path = safe_encode_path(path, base_dir="")
-        url = f"{self.upload_base_url}/{clean_id}/files/{encoded_path}"
-        params: Dict[str, str] = {}
-        if overwrite:
-            params["overwrite"] = "true"
-
-        headers: Dict[str, str] = {}
+        init_url = f"{self.upload_base_url}/{clean_id}/files/{encoded_path}"
+        
         if not mime_type:
             mime_type, _ = mimetypes.guess_type(path)
-        if mime_type:
-            headers["Content-Type"] = mime_type
+        mime_type = mime_type or "application/octet-stream"
 
-        res = self.session.put(url, params=params, headers=headers, data=content, timeout=self.timeout)
-        if res.status_code == 409:
-            return {"error": "CONFLICT", "status_code": 409, "message": res.text}
-        res.raise_for_status()
-        try:
-            return res.json()
-        except Exception:
-            return {"status": "ok", "status_code": res.status_code}
+        total_length = len(content)
+        init_params: Dict[str, str] = {"uploadType": "resumable"}
+        if overwrite:
+            init_params["overwrite"] = "true"
+
+        init_headers: Dict[str, str] = {
+            "X-Upload-Content-Type": mime_type,
+            "X-Upload-Content-Length": str(total_length),
+            "Content-Length": "0"
+        }
+
+        init_res = self.session.put(init_url, params=init_params, headers=init_headers, timeout=self.timeout)
+        if init_res.status_code == 409:
+            return {"error": "CONFLICT", "status_code": 409, "message": init_res.text}
+        init_res.raise_for_status()
+
+        upload_url = init_res.headers.get("Location")
+        if not upload_url:
+            # Fallback if direct response returned
+            try:
+                return init_res.json()
+            except Exception:
+                return {"status": "ok", "status_code": init_res.status_code}
+
+        # Resumable chunk upload loop
+        offset = 0
+        while True:
+            end = min(offset + chunk_size, total_length)
+            chunk = content[offset:end]
+            
+            # Note: Do not attach x-goog-api-key to session for upload_url if requests session reuses headers,
+            # but requests session headers are sent by default. Standard Google resumable upload URL accepts session.
+            chunk_headers = {
+                "Content-Type": mime_type,
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end - 1}/{total_length}" if total_length > 0 else "bytes */0"
+            }
+
+            res = self.session.put(upload_url, headers=chunk_headers, data=chunk, timeout=self.timeout)
+
+            if res.status_code in (200, 201):
+                try:
+                    return res.json()
+                except Exception:
+                    return {"status": "ok", "status_code": res.status_code}
+            elif res.status_code == 308:
+                # Resume Incomplete
+                range_header = res.headers.get("Range")
+                if range_header and range_header.startswith("bytes=0-"):
+                    offset = int(range_header.split("-")[1]) + 1
+                else:
+                    offset = end
+            else:
+                if res.status_code == 409:
+                    return {"error": "CONFLICT", "status_code": 409, "message": res.text}
+                res.raise_for_status()
 
 class SyncPlanner:
     """
@@ -241,7 +293,7 @@ class SyncPlanner:
         manifest = RemoteManifest(environment_id=environment_id)
         prefix = f"{base_dir}/" if base_dir else ""
         for rf in remote_files:
-            if rf.type == "DIRECTORY":
+            if rf.type.upper() in ("DIRECTORY", "DIR"):
                 continue
             norm_p = rf.path.replace("\\", "/")
             if norm_p.startswith("/"):

@@ -393,14 +393,7 @@ class WorkspaceSync:
 
             if status_code == 200:
                 self.key_pool.report_result(key_ref, status_code=200)
-                if self.project_id and self.registry:
-                    try:
-                        self.registry.update_project_state(
-                            project_id=self.project_id,
-                            active_key=key_ref
-                        )
-                    except Exception:
-                        pass
+                # Phase 7-2 / 7-3 Source of Truth: Do NOT write runtime active_key into ProjectRegistry
                 return parsed_result
 
             if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):

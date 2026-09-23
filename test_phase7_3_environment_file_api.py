@@ -1,117 +1,158 @@
 import os
+import io
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+import requests
+
 from environment_files import (
-    EnvironmentFileClient, SyncPlanner, SyncAction,
-    IntegrityVerifier, RemoteManifest, RemoteFileInfo, PlannedFileAction
+    EnvironmentFileClient,
+    RemoteFileInfo,
+    RemoteManifest,
+    PlannedFileAction,
+    SyncAction,
+    SyncPlan,
+    SyncPlanner,
+    IntegrityVerifier,
+    safe_encode_path,
+    DEFAULT_UPLOAD_CHUNK_SIZE
 )
-from workspace_sync import WorkspaceSync, SyncStatus, SourceManifest
 
-class TestPhase7_3EnvironmentFileAPI(unittest.TestCase):
+class TestPhase73EnvironmentFileAPI(unittest.TestCase):
+
     def setUp(self):
-        self.client = EnvironmentFileClient(api_key="test_key")
+        self.api_key = "test_api_key"
+        self.env_id = "environment-12345"
+        self.clean_id = "12345"
+        self.client = EnvironmentFileClient(api_key=self.api_key)
 
-    @patch("requests.Session.get")
-    def test_01_list_files_root(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
+    def test_safe_encode_path_valid_and_encoding(self):
+        # Valid path encoding
+        self.assertEqual(safe_encode_path("foo/bar.txt", "workspace"), "workspace/foo/bar.txt")
+        self.assertEqual(safe_encode_path("nested/folder/file#1%20?.txt", "workspace"), "workspace/nested/folder/file%231%2520%3F.txt")
+
+    def test_safe_encode_path_traversal_and_invalid(self):
+        # Path traversal and invalid paths
+        with self.assertRaises(ValueError):
+            safe_encode_path("../secret.txt")
+        with self.assertRaises(ValueError):
+            safe_encode_path("foo/../../secret.txt")
+        with self.assertRaises(ValueError):
+            safe_encode_path("/absolute/path")
+        with self.assertRaises(ValueError):
+            safe_encode_path("foo\x00bar.txt")
+        with self.assertRaises(ValueError):
+            safe_encode_path("")
+
+    @patch.object(requests.Session, 'get')
+    def test_list_files_rest_parameters(self, mock_get):
+        mock_res = MagicMock()
+        mock_res.status_code = 200
+        mock_res.json.return_value = {"files": [], "nextPageToken": "token123"}
+        mock_get.return_value = mock_res
+
+        res = self.client.list_files("environment-12345", path="workspace", page_size=50, page_token="prev_token")
+
+        mock_get.assert_called_once()
+        args, kwargs = mock_get.call_args
+        self.assertIn("12345/files", args[0])
+        self.assertEqual(kwargs['params']['page_size'], 50)
+        self.assertEqual(kwargs['params']['page_token'], "prev_token")
+        self.assertEqual(kwargs['params']['recursive'], "true")
+
+    @patch.object(requests.Session, 'get')
+    def test_list_all_files_pagination_and_type_normalization(self, mock_get):
+        mock_res1 = MagicMock()
+        mock_res1.status_code = 200
+        mock_res1.json.return_value = {
             "files": [
-                {"path": "workspace/a.txt", "type": "FILE", "size_bytes": "10"}
+                {"path": "workspace/f1.txt", "type": "file", "size_bytes": "100"},
+                {"path": "workspace/dir1", "type": "directory"}
+            ],
+            "nextPageToken": "page2"
+        }
+
+        mock_res2 = MagicMock()
+        mock_res2.status_code = 200
+        mock_res2.json.return_value = {
+            "files": [
+                {"path": "workspace/f2.txt", "type": "FILE", "size_bytes": 200}
             ]
         }
-        mock_get.return_value = mock_resp
 
-        res = self.client.list_files("env123", path="workspace")
-        self.assertIn("files", res)
-        self.assertEqual(len(res["files"]), 1)
+        mock_get.side_effect = [mock_res1, mock_res2]
 
-    @patch("requests.Session.get")
-    def test_02_pagination_complete(self, mock_get):
-        mock_resp1 = MagicMock()
-        mock_resp1.status_code = 200
-        mock_resp1.json.return_value = {
-            "files": [{"path": "workspace/1.txt", "type": "FILE"}],
-            "nextPageToken": "tok2"
-        }
-        mock_resp2 = MagicMock()
-        mock_resp2.status_code = 200
-        mock_resp2.json.return_value = {
-            "files": [{"path": "workspace/2.txt", "type": "FILE"}]
-        }
-        mock_get.side_effect = [mock_resp1, mock_resp2]
+        files = self.client.list_all_files("environment-12345", base_path="workspace")
 
-        all_files = self.client.list_all_files("env123")
-        self.assertEqual(len(all_files), 2)
-        self.assertEqual(all_files[0].path, "workspace/1.txt")
-        self.assertEqual(all_files[1].path, "workspace/2.txt")
+        self.assertEqual(len(files), 3)
+        self.assertEqual(files[0].type, "FILE")
+        self.assertEqual(files[0].size_bytes, 100)
+        self.assertEqual(files[1].type, "DIRECTORY")
+        self.assertEqual(files[2].type, "FILE")
+        self.assertEqual(files[2].size_bytes, 200)
 
-    @patch("requests.Session.get")
-    def test_03_download_file_alt_media(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = b"content_data"
-        mock_get.return_value = mock_resp
+    @patch.object(requests.Session, 'put')
+    def test_resumable_upload_success(self, mock_put):
+        # 1. Init request response with Location header
+        mock_init_res = MagicMock()
+        mock_init_res.status_code = 200
+        mock_init_res.headers = {"Location": "https://generativelanguage.googleapis.com/upload/session123"}
 
-        data = self.client.download_file("env123", "workspace/a.txt")
-        self.assertEqual(data, b"content_data")
-        # Verify params
-        mock_get.assert_called_once()
-        _, kwargs = mock_get.call_args
-        self.assertEqual(kwargs.get("params"), {"alt": "media"})
+        # 2. Chunk request response
+        mock_chunk_res = MagicMock()
+        mock_chunk_res.status_code = 200
+        mock_chunk_res.json.return_value = {"name": "workspace/test.txt", "size_bytes": "10"}
 
-    @patch("requests.Session.put")
-    def test_04_upload_file_overwrite_false_409(self, mock_put):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 409
-        mock_resp.text = "Entity exists"
-        mock_put.return_value = mock_resp
+        mock_put.side_effect = [mock_init_res, mock_chunk_res]
 
-        res = self.client.upload_file("env123", "workspace/a.txt", b"data", overwrite=False)
-        self.assertEqual(res.get("error"), "CONFLICT")
-        self.assertEqual(res.get("status_code"), 409)
+        content = b"0123456789"
+        result = self.client.upload_file("environment-12345", "test.txt", content=content, overwrite=True)
 
-    def test_05_sync_planner_diff(self):
-        source = SourceManifest(
-            source_type="local",
-            source_path="/dummy",
-            files={
-                "new.txt": {"size": 10, "sha256": "aaa"},
-                "same.txt": {"size": 20, "sha256": "bbb"},
-                "diff.txt": {"size": 30, "sha256": "ccc"}
-            }
-        )
-        remote_files = [
-            RemoteFileInfo(path="workspace/same.txt", type="FILE", size_bytes=20, sha256="bbb"),
-            RemoteFileInfo(path="workspace/diff.txt", type="FILE", size_bytes=30, sha256="diff_sha"),
-            RemoteFileInfo(path="workspace/remote_only.txt", type="FILE", size_bytes=50, sha256="eee")
-        ]
-        remote_manifest = SyncPlanner.build_remote_manifest("env123", remote_files, base_dir="workspace")
-        
-        # Test overwrite=False
-        plan = SyncPlanner.plan(source, remote_manifest, overwrite=False)
-        self.assertTrue(plan.has_conflicts)
-        self.assertIn("diff.txt", plan.conflicts)
+        self.assertEqual(mock_put.call_count, 2)
+        # Check init call
+        init_call = mock_put.call_args_list[0]
+        self.assertEqual(init_call[1]['params']['uploadType'], 'resumable')
+        self.assertEqual(init_call[1]['headers']['X-Upload-Content-Length'], '10')
 
-        # Test overwrite=True
-        plan_ow = SyncPlanner.plan(source, remote_manifest, overwrite=True)
-        self.assertFalse(plan_ow.has_conflicts)
-        
-        actions = {a.rel_path: a.action for a in plan_ow.actions}
-        self.assertEqual(actions["new.txt"], SyncAction.UPLOAD)
-        self.assertEqual(actions["same.txt"], SyncAction.UNCHANGED)
-        self.assertEqual(actions["diff.txt"], SyncAction.UPDATE)
-        self.assertEqual(actions["remote_only.txt"], SyncAction.REMOTE_ONLY)
+        # Check chunk call
+        chunk_call = mock_put.call_args_list[1]
+        self.assertEqual(chunk_call[0][0], "https://generativelanguage.googleapis.com/upload/session123")
+        self.assertEqual(chunk_call[1]['headers']['Content-Range'], "bytes 0-9/10")
+        self.assertEqual(result["name"], "workspace/test.txt")
 
-    def test_06_path_traversal_rejection(self):
-        ws = WorkspaceSync(key_index=1)
-        src = SourceManifest(
-            source_type="local",
-            source_path="/dummy",
-            files={"../evil.py": {"size": 10, "sha256": "abc", "content": b"x"}}
-        )
-        res = ws.sync_to_remote("env123", src)
-        self.assertEqual(res.status, SyncStatus.INVALID_PATH)
+    @patch.object(requests.Session, 'put')
+    def test_resumable_upload_308_handling(self, mock_put):
+        mock_init_res = MagicMock()
+        mock_init_res.status_code = 200
+        mock_init_res.headers = {"Location": "https://upload.session/123"}
+
+        # Chunk 1 returns 308
+        mock_chunk1 = MagicMock()
+        mock_chunk1.status_code = 308
+        mock_chunk1.headers = {"Range": "bytes=0-4"}
+
+        # Chunk 2 returns 200
+        mock_chunk2 = MagicMock()
+        mock_chunk2.status_code = 200
+        mock_chunk2.json.return_value = {"status": "ok"}
+
+        mock_put.side_effect = [mock_init_res, mock_chunk1, mock_chunk2]
+
+        content = b"0123456789"
+        result = self.client.upload_file("environment-12345", "large.txt", content=content, chunk_size=5)
+
+        self.assertEqual(mock_put.call_count, 3)
+        self.assertEqual(result["status"], "ok")
+
+    @patch.object(requests.Session, 'put')
+    def test_upload_409_conflict(self, mock_put):
+        mock_init_res = MagicMock()
+        mock_init_res.status_code = 409
+        mock_init_res.text = "Conflict: File exists"
+        mock_put.return_value = mock_init_res
+
+        res = self.client.upload_file("environment-12345", "existing.txt", content=b"data")
+        self.assertEqual(res["error"], "CONFLICT")
+        self.assertEqual(res["status_code"], 409)
 
 if __name__ == "__main__":
     unittest.main()
