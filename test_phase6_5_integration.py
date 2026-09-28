@@ -10,6 +10,7 @@ from keys import KeyPoolManager, AllKeysExhaustedError
 from registry import ProjectRegistry
 from client import AntigravityClient
 from workspace_sync import WorkspaceSync, SyncStatus, SourceManifest
+from sessions import SessionStateManager
 
 class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
     def setUp(self):
@@ -198,7 +199,6 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
             pdir = os.path.join(self.test_dir.name, "projA")
             os.makedirs(pdir, exist_ok=True)
             registry.register_project(pdir, project_id="project-A")
-            registry.update_project_state("project-A", active_key="key1")
 
             client = AntigravityClient(key_pool=pool, project_id="project-A", registry=registry)
             res = client.create_interaction(prompt="cascade test")
@@ -296,7 +296,6 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
             pdir = os.path.join(self.test_dir.name, "projA")
             os.makedirs(pdir, exist_ok=True)
             registry.register_project(pdir, project_id="project-A")
-            registry.update_project_state("project-A", active_key="key1")
 
             manifest = SourceManifest(
                 source_type="local",
@@ -305,7 +304,18 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
                 total_size=0
             )
 
-            ws = WorkspaceSync(key_pool=pool, project_id="project-A", registry=registry)
+            # Option 1: SessionStateManager bound_key verification (New Source of Truth)
+            session_mgr = SessionStateManager(storage_path=os.path.join(self.test_dir.name, "sessions.json"))
+            session_id = "sess_project-A"
+            session_mgr.create_session(project_id="project-A", session_id=session_id, bound_key="key1")
+
+            ws = WorkspaceSync(
+                key_pool=pool,
+                project_id="project-A",
+                registry=registry,
+                session_manager=session_mgr,
+                session_id=session_id
+            )
             conflicts, err_type, err_msg = ws.check_remote_conflicts("env_1", manifest)
 
             self.assertEqual(conflicts, [])
@@ -314,7 +324,14 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
             status = pool.get_status()
             self.assertEqual(status["key1"]["state"], "COOLDOWN")
             self.assertEqual(status["key2"]["state"], "ACTIVE")
-            self.assertEqual(registry.get_project("project-A")["active_key"], "key2")
+
+            # Verify that rollover update occurs in SessionStateManager bound_key,
+            # while ProjectRegistry retains static metadata and does not write active_key at runtime.
+            sess_data = session_mgr.get_session(session_id)
+            self.assertIsNotNone(sess_data)
+            self.assertEqual(sess_data["bound_key"], "key2")
+            # ProjectRegistry retains initial or static registration state
+            self.assertNotIn("active_key", registry.get_project("project-A") or {})
 
 
 if __name__ == "__main__":

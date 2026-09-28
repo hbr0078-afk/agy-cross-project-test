@@ -319,6 +319,10 @@ class WorkspaceSync:
             status_code, data, err_text = self._execute_conflict_check_request(clean_env_id, api_key)
             return self._parse_conflict_data(clean_env_id, manifest, status_code, data, err_text)
 
+        tried_keys = set()
+        same_key_retried = set()
+        excluded_keys = set()
+
         # 2. KeyPool mode with session safety
         assert self.key_pool is not None
 
@@ -339,16 +343,23 @@ class WorkspaceSync:
                 status_code, res_json, err_text = self._execute_conflict_check_request(clean_env_id, raw_key)
                 if status_code == 200:
                     self.key_pool.report_result(bound_ref, status_code=200)
-                return self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
+                    return self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
+
+                # Report failure to pool
+                self.key_pool.report_result(bound_ref, status_code=status_code)
+
+                # Terminal environment errors should return immediately
+                if status_code in (400, 404):
+                    return self._parse_conflict_data(clean_env_id, manifest, status_code, res_json, err_text)
+
+                # Transient key failures (429, 401, etc.) allow falling through to rollover loop
+                excluded_keys.add(bound_ref)
 
         # Discovered keys check
         discovered_keys = self.key_pool.discover_keys()
         total_keys = len(discovered_keys) if discovered_keys else 1
         max_attempts = max(total_keys * 2, 4)
 
-        tried_keys = set()
-        same_key_retried = set()
-        excluded_keys = set()
         attempts = 0
         last_parsed = None
 
@@ -393,7 +404,14 @@ class WorkspaceSync:
 
             if status_code == 200:
                 self.key_pool.report_result(key_ref, status_code=200)
-                # Phase 7-2 / 7-3 Source of Truth: Do NOT write runtime active_key into ProjectRegistry
+                # Phase 7-2 / 7-3 Source of Truth: Update SessionStateManager bound_key on successful key acquisition/rollover
+                if self.session_manager and (self.session_id or self.project_id):
+                    sid = self.session_id or (f"sess_{self.project_id}" if self.project_id else None)
+                    if sid:
+                        try:
+                            self.session_manager.update_session(sid, bound_key=key_ref)
+                        except Exception:
+                            pass
                 return parsed_result
 
             if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):

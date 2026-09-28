@@ -16,6 +16,8 @@ AGENT_NAME = "antigravity-preview-09-2026"
 class TestPhase7_1LiveSpike(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not os.environ.get("ENABLE_LIVE_SPIKE"):
+            raise unittest.SkipTest("Live Spike isolated: set ENABLE_LIVE_SPIKE=1 to run")
         cls.k1 = get_api_key_by_index(1)
         cls.k2 = get_api_key_by_index(2)
         if not cls.k1 or not cls.k2:
