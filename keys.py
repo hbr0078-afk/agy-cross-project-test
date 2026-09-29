@@ -181,6 +181,9 @@ class KeyPoolManager:
         keys_dict = data.setdefault("keys", {})
         for idx in discovered:
             ref = f"key{idx}"
+            # Discover tenant_id if available (AGY_TENANT_{idx} or GEMINI_TENANT_{idx})
+            tenant_id = os.environ.get(f"AGY_TENANT_{idx}") or os.environ.get(f"GEMINI_TENANT_{idx}") or ""
+            
             if ref not in keys_dict:
                 keys_dict[ref] = {
                     "index": idx,
@@ -190,11 +193,23 @@ class KeyPoolManager:
                     "cooldown_until": None,
                     "last_used_at": 0,
                     "last_success_at": 0,
+                    "tenant_id": tenant_id
                 }
             else:
-                # Ensure index is saved
+                # Ensure index and tenant_id are saved
                 keys_dict[ref]["index"] = idx
+                # Update tenant_id if provided in environment and currently empty or changed
+                if tenant_id and keys_dict[ref].get("tenant_id") != tenant_id:
+                    keys_dict[ref]["tenant_id"] = tenant_id
         return data
+
+    def get_key_tenant(self, key_ref: str) -> str:
+        """Returns the tenant_id associated with a key reference."""
+        def _read():
+            data = self._load_raw()
+            entry = data.get("keys", {}).get(key_ref)
+            return entry.get("tenant_id", "") if entry else ""
+        return self._with_lock(_read)
 
     def acquire_key(
         self,

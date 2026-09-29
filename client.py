@@ -50,6 +50,7 @@ class AntigravityClient:
         resolved_env_id = environment_id
         resolved_prev_id = previous_interaction_id
         target_session = None
+        session_tenant = ""
 
         if self.session_manager and (session_id or target_project_id):
             sid = session_id or (f"sess_{target_project_id}" if target_project_id else None)
@@ -62,6 +63,7 @@ class AntigravityClient:
                         environment_id=environment_id
                     )
                 if target_session:
+                    session_tenant = target_session.get("tenant_id", "")
                     if not resolved_env_id and target_session.get("environment_id"):
                         resolved_env_id = target_session["environment_id"]
                     if not resolved_prev_id and target_session.get("last_interaction_id"):
@@ -78,6 +80,8 @@ class AntigravityClient:
             )
             if res.get("success") and target_session and self.session_manager:
                 try:
+                    # Update session but preserve tenant if it was already set
+                    # or set it from key if possible (though in single-key mode we might not know)
                     self.session_manager.update_session(
                         session_id=target_session["session_id"],
                         environment_id=res.get("environment_id"),
@@ -96,6 +100,7 @@ class AntigravityClient:
             timeout=timeout,
             project_id=target_project_id,
             session_id=target_session.get("session_id") if target_session else session_id,
+            session_tenant=session_tenant
         )
 
     def _execute_request(
@@ -177,19 +182,18 @@ class AntigravityClient:
         timeout: int,
         project_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        session_tenant: str = "",
     ) -> Dict[str, Any]:
         """
         Manages key-pool lifecycle:
         - Acquires an active key from KeyPoolManager
-        - Reports outcome to KeyPoolManager (200, 429, 401, 403, 5xx, timeout/network)
-        - Retries on same key once for 5xx / network errors
-        - Rotates to next available key on 429, 401, 403, and exhausted 5xx/network errors
-        - Immediately stops on 4xx client errors (400, 404, etc.) without rotation
-        - Stops if all keys are exhausted (raises AllKeysExhaustedError) or retry limit reached
+        - Handles same-tenant rollover and cross-tenant fallback
+        - Prevents cross-tenant 404s by checking tenant metadata
+        - Recovers from interaction (404) or environment (404) loss
+        - Reports outcome to KeyPoolManager
         """
         discovered_keys = self._key_pool.discover_keys()
         total_keys = len(discovered_keys) if discovered_keys else 1
-        # Safe retry bound: allow up to total_keys rotations, with 1 retry per key for transient errors
         max_attempts = max(total_keys * 2, 4)
 
         tried_keys = set()
@@ -198,150 +202,157 @@ class AntigravityClient:
         attempts = 0
         last_result = None
 
+        current_env_id = environment_id
+        current_prev_id = previous_interaction_id
+        current_tenant = session_tenant
+
         while attempts < max_attempts:
             attempts += 1
             try:
-                # Prioritize project_id's active_key from registry if project_id is provided
+                # 1. Selection Strategy: Prioritize same-tenant keys if we have a session_tenant
                 prefer_candidate = None
                 if project_id and self.registry:
                     try:
                         p = self.registry.get_project(project_id)
                         if p and p.get("active_key") and p["active_key"] not in excluded_keys:
                             prefer_candidate = p["active_key"]
-                    except Exception:
-                        pass
+                    except Exception: pass
 
                 if not prefer_candidate:
-                    data = self._key_pool.get_status()
-                    candidates = [
-                        k for k, v in data.items()
-                        if v.get("state") == "ACTIVE" and k not in excluded_keys
-                    ]
-                    prefer_candidate = candidates[0] if candidates else None
+                    status_data = self._key_pool.get_status()
+                    active_candidates = [k for k, v in status_data.items() if v.get("state") == "ACTIVE" and k not in excluded_keys]
+                    
+                    if current_tenant:
+                        same_tenant = [k for k in active_candidates if status_data[k].get("tenant_id") == current_tenant]
+                        if same_tenant:
+                            prefer_candidate = same_tenant[0]
+                    
+                    if not prefer_candidate and active_candidates:
+                        prefer_candidate = active_candidates[0]
 
                 key_ref, key_idx = self._key_pool.acquire_key(
                     prefer_key=prefer_candidate,
                     project_id=project_id,
                     registry=self.registry
                 )
-
-                if key_ref in excluded_keys:
-                    # If acquired key was previously excluded during this transaction, acquire next available
-                    data = self._key_pool.get_status()
-                    candidates = [
-                        k for k, v in data.items()
-                        if v.get("state") == "ACTIVE" and k not in excluded_keys
-                    ]
-                    if not candidates:
-                        raise AllKeysExhaustedError("All non-excluded active keys exhausted.")
-                    key_ref, key_idx = self._key_pool.acquire_key(prefer_key=candidates[0])
             except AllKeysExhaustedError:
-                if last_result is not None:
-                    return last_result
+                if last_result is not None: return last_result
                 raise
 
             tried_keys.add(key_ref)
             raw_key = get_api_key_by_index(key_idx)
             if not raw_key:
-                # Key index found in discovery but raw key not readable -> mark INACTIVE
                 self._key_pool.report_result(key_ref, status_code=401)
                 excluded_keys.add(key_ref)
                 continue
 
+            # 2. Cross-Tenant 404 Prevention
+            chosen_tenant = self._key_pool.get_key_tenant(key_ref)
+            if current_tenant and chosen_tenant and current_tenant != chosen_tenant:
+                # Tenant mismatch detected before API call -> clear environment & interaction context
+                current_env_id = None
+                current_prev_id = None
+                current_tenant = chosen_tenant
+                if session_id and self.session_manager:
+                    self.session_manager.invalidate_session(session_id)
+            elif not current_tenant and chosen_tenant:
+                current_tenant = chosen_tenant
+
+            # 3. Execute Request
             result = self._execute_request(
                 api_key=raw_key,
                 prompt=prompt,
                 environment=environment,
-                environment_id=environment_id,
-                previous_interaction_id=previous_interaction_id,
+                environment_id=current_env_id,
+                previous_interaction_id=current_prev_id,
                 timeout=timeout,
             )
             result["key_ref"] = key_ref
             result["key_index"] = key_idx
             last_result = result
-
             status_code = result.get("status_code")
 
-            # 1. Success (200)
+            # 4. Handle Success
             if result.get("success") and status_code == 200:
                 self._key_pool.report_result(key_ref, status_code=200)
+                new_env_id = result.get("environment_id")
+                
+                # If environment changed (e.g. fresh environment provisioned due to fallback)
+                if new_env_id and new_env_id != environment_id and project_id and self.registry:
+                    self._sync_project_to_environment(new_env_id, project_id, session_id)
+
                 if session_id and self.session_manager:
-                    # Session mode: update runtime state ONLY in SessionStateManager
                     try:
                         self.session_manager.update_session(
                             session_id=session_id,
                             bound_key=key_ref,
-                            environment_id=result.get("environment_id"),
+                            tenant_id=chosen_tenant,
+                            environment_id=new_env_id,
                             last_interaction_id=result.get("interaction_id"),
                             state="ACTIVE"
                         )
-                    except Exception:
-                        pass
+                    except Exception: pass
+                elif project_id and self.registry:
+                    try:
+                        self.registry.update_project_state(
+                            project_id=project_id,
+                            active_key=key_ref,
+                            environment_id=new_env_id,
+                            last_interaction_id=result.get("interaction_id")
+                        )
+                    except Exception: pass
+                return result
+
+            # 5. Handle 404 (Environment or Interaction missing)
+            if status_code == 404:
+                if current_prev_id:
+                    # Case A: Interaction lost but environment might be fine -> reset interaction_id and retry
+                    current_prev_id = None
+                    attempts -= 1
+                    continue
                 else:
-                    # Non-session mode: update project active_key in registry if project_id is provided
-                    if project_id and self.registry:
-                        try:
-                            self.registry.update_project_state(
-                                project_id=project_id,
-                                active_key=key_ref,
-                                environment_id=result.get("environment_id"),
-                                last_interaction_id=result.get("interaction_id")
-                            )
-                        except Exception:
-                            pass
-                return result
-
-            # 2. Client error (400, 404, etc. excluding 401, 403, 429) -> Do NOT rotate
-            if status_code is not None and 400 <= status_code < 500 and status_code not in (401, 403, 429):
-                self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
-                return result
-
-            # 3. 429 (Rate limit) -> Cooldown & Rotate to next key immediately
-            if status_code == 429:
-                self._key_pool.report_result(key_ref, status_code=429, error_data=result.get("error"))
-                excluded_keys.add(key_ref)
-                continue
-
-            # 4. 401 (Invalid auth) -> Inactive & Rotate to next key immediately
-            if status_code == 401:
-                self._key_pool.report_result(key_ref, status_code=401, error_data=result.get("error"))
-                excluded_keys.add(key_ref)
-                continue
-
-            # 5. 403 (Forbidden) -> Record failure via report_result & Rotate to next key
-            if status_code == 403:
-                self._key_pool.report_result(key_ref, status_code=403, error_data=result.get("error"))
-                excluded_keys.add(key_ref)
-                continue
-
-            # 6. 5xx (Server error) -> Retry same key once, then rotate
-            if status_code is not None and status_code in (500, 502, 503, 504):
-                if key_ref not in same_key_retried:
-                    same_key_retried.add(key_ref)
-                    # Retry same key once without switching
+                    # Case B: Environment lost or Cross-Tenant 은폐형 404 -> reset environment_id and retry fresh
+                    if session_id and self.session_manager:
+                        self.session_manager.invalidate_session(session_id)
+                    current_env_id = None
+                    current_tenant = chosen_tenant
+                    attempts -= 1
                     continue
-                # Already retried same key once -> report to pool and rotate
+
+            # 6. Handle Rollover (429, 401, 403)
+            if status_code in (429, 401, 403):
                 self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
                 excluded_keys.add(key_ref)
                 continue
 
-            # 7. Network / Timeout error (status_code is None or 0) -> Retry same key once, then rotate
-            if status_code is None or status_code == 0:
+            # 7. Handle Transient Errors (5xx, Network)
+            if status_code is None or status_code == 0 or status_code >= 500:
                 if key_ref not in same_key_retried:
                     same_key_retried.add(key_ref)
-                    # Retry same key once without switching
+                    attempts -= 1
                     continue
-                # Already retried same key once -> report to pool and rotate
-                self._key_pool.report_result(key_ref, status_code=None, error_data=result.get("error"))
+                self._key_pool.report_result(key_ref, status_code=status_code)
                 excluded_keys.add(key_ref)
                 continue
 
-            # Default fallback for unhandled codes
-            self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
-            excluded_keys.add(key_ref)
+            # Default client error
+            self._key_pool.report_result(key_ref, status_code=status_code)
+            return result
 
-        return last_result if last_result is not None else {
-            "success": False,
-            "status_code": None,
-            "error": {"error": "Maximum rollover attempts reached"},
-        }
+        return last_result or {"success": False, "error": "Max attempts reached"}
+
+    def _sync_project_to_environment(self, environment_id: str, project_id: str, session_id: Optional[str]):
+        """Runs WorkspaceSync to populate project files in a new environment."""
+        proj = self.registry.get_project(project_id) if self.registry else None
+        if proj and proj.get("path"):
+            from workspace_sync import WorkspaceSync
+            ws = WorkspaceSync(
+                key_pool=self._key_pool,
+                project_id=project_id,
+                registry=self.registry,
+                session_manager=self.session_manager,
+                session_id=session_id
+            )
+            manifest, err = ws.prepare_source_from_local(proj["path"])
+            if manifest:
+                ws.sync_to_remote(environment_id, manifest, overwrite=True)
