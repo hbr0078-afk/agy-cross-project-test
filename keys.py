@@ -215,15 +215,18 @@ class KeyPoolManager:
         self,
         prefer_key: Optional[str] = None,
         project_id: Optional[str] = None,
-        registry: Optional[Any] = None
+        registry: Optional[Any] = None,
+        tenant_id: Optional[str] = None,
+        exclude_keys: Optional[Any] = None
     ) -> Tuple[str, int]:
         """
         Acquires an available ACTIVE key reference and its 1-based index under lock.
         Checks and recovers expired COOLDOWN states.
         Selects based on:
-        1. prefer_key if specified and currently eligible
-        2. Project's active_key from registry if project_id is specified
-        3. Least-recently-used (lowest last_used_at) eligible key
+        1. If tenant_id is specified: prioritizes active keys matching tenant_id first.
+        2. prefer_key if specified and currently eligible.
+        3. Project's active_key from registry if project_id is specified and eligible.
+        4. Least-recently-used (lowest last_used_at) eligible key.
         Returns (key_ref, key_index).
         Raises AllKeysExhaustedError if no keys are eligible.
         """
@@ -242,20 +245,31 @@ class KeyPoolManager:
                         entry["cooldown_until"] = None
                         entry["fail_count"] = 0
 
-            # Eligible candidates: state == 'ACTIVE'
-            eligible = [ref for ref, e in keys_dict.items() if e.get("state") == "ACTIVE"]
+            excluded_set = set(exclude_keys) if exclude_keys else set()
+
+            # Eligible candidates: state == 'ACTIVE' and not excluded
+            eligible = [ref for ref, e in keys_dict.items() if e.get("state") == "ACTIVE" and ref not in excluded_set]
 
             if not eligible:
                 self._save_raw(data)
                 raise AllKeysExhaustedError("All API keys in the pool are exhausted (INACTIVE or in COOLDOWN).")
 
             chosen_ref = None
-            
-            # 1. Check prefer_key
-            if prefer_key and prefer_key in eligible:
+
+            # 1. Tenant-aware candidate filtering: if tenant_id is provided, try same-tenant keys first
+            same_tenant_eligible = []
+            if tenant_id:
+                same_tenant_eligible = [r for r in eligible if keys_dict[r].get("tenant_id") == tenant_id]
+
+            candidates = same_tenant_eligible if same_tenant_eligible else eligible
+
+            # 2. Check prefer_key within candidates (or overall eligible if prefer_key explicitly requested and matching tenant)
+            if prefer_key and prefer_key in candidates:
                 chosen_ref = prefer_key
-                
-            # 2. Check project binding
+            elif prefer_key and not same_tenant_eligible and prefer_key in eligible:
+                chosen_ref = prefer_key
+
+            # 3. Check project binding
             if not chosen_ref and project_id:
                 try:
                     reg = registry
@@ -265,15 +279,15 @@ class KeyPoolManager:
                     p = reg.get_project(project_id)
                     if p:
                         proj_key = p.get("active_key")
-                        if proj_key in eligible:
+                        if proj_key in candidates:
                             chosen_ref = proj_key
                 except Exception:
                     pass
 
-            # 3. Least-recently-used selection
+            # 4. Least-recently-used selection within candidates
             if not chosen_ref:
-                eligible.sort(key=lambda r: keys_dict[r].get("last_used_at", 0))
-                chosen_ref = eligible[0]
+                candidates.sort(key=lambda r: keys_dict[r].get("last_used_at", 0))
+                chosen_ref = candidates[0]
 
             # Mark last_used_at atomically
             keys_dict[chosen_ref]["last_used_at"] = now

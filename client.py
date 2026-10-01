@@ -233,7 +233,9 @@ class AntigravityClient:
                 key_ref, key_idx = self._key_pool.acquire_key(
                     prefer_key=prefer_candidate,
                     project_id=project_id,
-                    registry=self.registry
+                    registry=self.registry,
+                    tenant_id=current_tenant,
+                    exclude_keys=excluded_keys
                 )
             except AllKeysExhaustedError:
                 if last_result is not None: return last_result
@@ -291,8 +293,16 @@ class AntigravityClient:
                             state="ACTIVE"
                         )
                     except Exception: pass
-                # In session mode, SessionStateManager is the single source of truth for runtime state.
-                # ProjectRegistry must NOT be updated with runtime session state.
+                elif project_id and self.registry:
+                    # Non-session mode (Phase 6-4 legacy mode): update project state in registry
+                    try:
+                        self.registry.update_project_state(
+                            project_id=project_id,
+                            active_key=key_ref,
+                            environment_id=new_env_id,
+                            last_interaction_id=interaction_id
+                        )
+                    except Exception: pass
 
                 # If environment changed (e.g. fresh environment provisioned due to fallback)
                 if new_env_id and new_env_id != environment_id and project_id and self.registry:
