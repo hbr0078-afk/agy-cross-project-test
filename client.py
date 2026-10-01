@@ -276,11 +276,10 @@ class AntigravityClient:
             if result.get("success") and status_code == 200:
                 self._key_pool.report_result(key_ref, status_code=200)
                 new_env_id = result.get("environment_id")
+                interaction_id = result.get("interaction_id")
                 
-                # If environment changed (e.g. fresh environment provisioned due to fallback)
-                if new_env_id and new_env_id != environment_id and project_id and self.registry:
-                    self._sync_project_to_environment(new_env_id, project_id, session_id)
-
+                # Update session/registry state BEFORE Sync (Phase 7-4 fix)
+                # This ensures WorkspaceSync uses the new key/tenant context.
                 if session_id and self.session_manager:
                     try:
                         self.session_manager.update_session(
@@ -288,19 +287,17 @@ class AntigravityClient:
                             bound_key=key_ref,
                             tenant_id=chosen_tenant,
                             environment_id=new_env_id,
-                            last_interaction_id=result.get("interaction_id"),
+                            last_interaction_id=interaction_id,
                             state="ACTIVE"
                         )
                     except Exception: pass
-                elif project_id and self.registry:
-                    try:
-                        self.registry.update_project_state(
-                            project_id=project_id,
-                            active_key=key_ref,
-                            environment_id=new_env_id,
-                            last_interaction_id=result.get("interaction_id")
-                        )
-                    except Exception: pass
+                # In session mode, SessionStateManager is the single source of truth for runtime state.
+                # ProjectRegistry must NOT be updated with runtime session state.
+
+                # If environment changed (e.g. fresh environment provisioned due to fallback)
+                if new_env_id and new_env_id != environment_id and project_id and self.registry:
+                    self._sync_project_to_environment(new_env_id, project_id, session_id)
+
                 return result
 
             # 5. Handle 404 (Environment or Interaction missing)

@@ -67,7 +67,7 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
             )
             res = client.create_interaction(prompt="hi", session_id="sess-1")
             self.assertTrue(res["success"])
-            
+
             sess = self.session_manager.get_session("sess-1")
             self.assertEqual(sess["state"], "ACTIVE")
             self.assertEqual(sess["environment_id"], "env-1")
@@ -77,7 +77,7 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
         # Test 3: ACTIVE -> INVALIDATED explicitly
         self.session_manager.create_session(project_id="proj-1", session_id="sess-1")
         self.session_manager.update_session("sess-1", state="ACTIVE")
-        
+
         inv = self.session_manager.invalidate_session("sess-1")
         self.assertEqual(inv["state"], "INVALIDATED")
 
@@ -86,7 +86,7 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
         # Test 4: Key1 (Tenant A) 429 -> Key2 (Tenant A) Success -> Same environment
         resp_429 = MagicMock(status_code=429)
         resp_429.json.return_value = {"error": {"message": "Rate limit"}}
-        
+
         resp_200 = MagicMock(status_code=200)
         resp_200.json.return_value = {
             "status": "completed",
@@ -103,8 +103,8 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             # Pre-bind session to key1 and env-shared
             self.session_manager.create_session(
-                project_id="proj-1", 
-                session_id="sess-1", 
+                project_id="proj-1",
+                session_id="sess-1",
                 bound_key="key1",
                 tenant_id="tenant-A",
                 environment_id="env-shared"
@@ -117,16 +117,16 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
                 registry=self.registry,
                 session_manager=self.session_manager
             )
-            
+
             res = client.create_interaction(prompt="retry", session_id="sess-1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
-            
+
             sess = self.session_manager.get_session("sess-1")
             self.assertEqual(sess["bound_key"], "key2")
             self.assertEqual(sess["environment_id"], "env-shared")
             self.assertEqual(sess["state"], "ACTIVE")
-            
+
             # Verify both calls used same environment_id
             self.assertEqual(mock_post.call_count, 2)
             for call in mock_post.call_args_list:
@@ -136,11 +136,11 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
     @patch("workspace_sync.WorkspaceSync.sync_to_remote")
     def test_05_cross_tenant_fallback(self, mock_sync, mock_post):
         # Test 5: Key1 (Tenant A) unavailable -> Key2 (Tenant B) -> Invalidate, New Env, Sync
-        
+
         # Key1 fails (e.g. 429)
         resp_429 = MagicMock(status_code=429)
         resp_429.json.return_value = {"error": {"message": "Rate limit"}}
-        
+
         # Key2 succeeds
         resp_200 = MagicMock(status_code=200)
         resp_200.json.return_value = {
@@ -150,7 +150,7 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
             "output": "fresh start"
         }
         mock_post.side_effect = [resp_429, resp_200]
-        
+
         # WorkspaceSync mock
         mock_sync.return_value = SyncResult(status=SyncStatus.SYNC_SUCCESS, environment_id="env-new-tenant-B")
 
@@ -161,8 +161,8 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             # Pre-bind session to key1 and env-A
             self.session_manager.create_session(
-                project_id="proj-1", 
-                session_id="sess-1", 
+                project_id="proj-1",
+                session_id="sess-1",
                 bound_key="key1",
                 tenant_id="tenant-A",
                 environment_id="env-A"
@@ -175,22 +175,22 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
                 registry=self.registry,
                 session_manager=self.session_manager
             )
-            
+
             res = client.create_interaction(prompt="fallback", session_id="sess-1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
-            
+
             sess = self.session_manager.get_session("sess-1")
             self.assertEqual(sess["bound_key"], "key2")
             self.assertEqual(sess["tenant_id"], "tenant-B")
             self.assertEqual(sess["environment_id"], "env-new-tenant-B")
             self.assertEqual(sess["state"], "ACTIVE")
-            
+
             # Verify first call used env-A, second call created a fresh environment (no environment_id sent)
             self.assertEqual(mock_post.call_count, 2)
             self.assertEqual(mock_post.call_args_list[0][1]["json"]["environment_id"], "env-A")
             self.assertNotIn("environment_id", mock_post.call_args_list[1][1]["json"])
-            
+
             # Verify WorkspaceSync was called for the new environment
             mock_sync.assert_called_once()
             self.assertEqual(mock_sync.call_args[0][0], "env-new-tenant-B")
@@ -198,7 +198,7 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
     @patch("client.requests.post")
     def test_06_cross_tenant_404_prevention(self, mock_post):
         # Test 6: If current session tenant != chosen key tenant, skip continuation and start fresh
-        
+
         # Success on new tenant
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {
@@ -218,11 +218,11 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
             # We simulate key1 being INACTIVE
             kp = self.key_pool
             kp.discover_keys()
-            kp.report_result("key1", status_code=401) 
+            kp.report_result("key1", status_code=401)
 
             self.session_manager.create_session(
-                project_id="proj-1", 
-                session_id="sess-1", 
+                project_id="proj-1",
+                session_id="sess-1",
                 bound_key="key1",
                 tenant_id="tenant-A",
                 environment_id="env-A"
@@ -235,15 +235,15 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
                 registry=self.registry,
                 session_manager=self.session_manager
             )
-            
+
             # Mock WorkspaceSync to avoid real sync
             with patch("workspace_sync.WorkspaceSync.sync_to_remote") as mock_sync:
                 mock_sync.return_value = SyncResult(status=SyncStatus.SYNC_SUCCESS, environment_id="env-B")
-                
+
                 res = client.create_interaction(prompt="fresh", session_id="sess-1")
                 self.assertTrue(res["success"])
                 self.assertEqual(res["key_ref"], "key2")
-                
+
                 # Should NOT have tried to use env-A because of tenant mismatch; should start fresh without environment_id
                 self.assertEqual(mock_post.call_count, 1)
                 payload = mock_post.call_args[1]["json"]
@@ -253,11 +253,11 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
     @patch("client.requests.post")
     def test_07_same_tenant_interaction_recovery(self, mock_post):
         # Test 7: Interaction 404 (Interaction missing) -> Keep environment, Reset Interaction
-        
+
         # Interaction fails with 404
         resp_404 = MagicMock(status_code=404)
         resp_404.json.return_value = {"error": {"message": "Requested entity was not found."}}
-        
+
         # Second attempt without interaction id succeeds
         resp_200 = MagicMock(status_code=200)
         resp_200.json.return_value = {
@@ -271,8 +271,8 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
         env = {"AGY_KEY_1": "secret-1", "AGY_TENANT_1": "tenant-A"}
         with patch.dict(os.environ, env, clear=True):
             self.session_manager.create_session(
-                project_id="proj-1", 
-                session_id="sess-1", 
+                project_id="proj-1",
+                session_id="sess-1",
                 bound_key="key1",
                 tenant_id="tenant-A",
                 environment_id="env-1"
@@ -285,11 +285,11 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
                 registry=self.registry,
                 session_manager=self.session_manager
             )
-            
+
             res = client.create_interaction(prompt="fix interaction", session_id="sess-1")
             self.assertTrue(res["success"])
             self.assertEqual(res["interaction_id"], "int-new")
-            
+
             # Verify environment was preserved
             self.assertEqual(mock_post.call_count, 2)
             self.assertEqual(mock_post.call_args_list[0][1]["json"]["previous_interaction_id"], "int-old")
@@ -300,11 +300,11 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
     @patch("workspace_sync.WorkspaceSync.sync_to_remote")
     def test_08_environment_loss_recovery(self, mock_sync, mock_post):
         # Test 8: Environment 404 (Environment missing) -> Invalidate, New Env, Sync, New Interaction
-        
+
         # Interaction/Env fails with 404
         resp_404 = MagicMock(status_code=404)
         resp_404.json.return_value = {"error": {"message": "Requested entity was not found."}}
-        
+
         # Fresh success
         resp_200 = MagicMock(status_code=200)
         resp_200.json.return_value = {
@@ -314,14 +314,14 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
             "output": "env recovered"
         }
         mock_post.side_effect = [resp_404, resp_200]
-        
+
         mock_sync.return_value = SyncResult(status=SyncStatus.SYNC_SUCCESS, environment_id="env-fresh")
 
         env = {"AGY_KEY_1": "secret-1", "AGY_TENANT_1": "tenant-A"}
         with patch.dict(os.environ, env, clear=True):
             self.session_manager.create_session(
-                project_id="proj-1", 
-                session_id="sess-1", 
+                project_id="proj-1",
+                session_id="sess-1",
                 bound_key="key1",
                 tenant_id="tenant-A",
                 environment_id="env-old"
@@ -334,17 +334,81 @@ class TestPhase7_4SessionLifecycle(unittest.TestCase):
                 registry=self.registry,
                 session_manager=self.session_manager
             )
-            
+
             res = client.create_interaction(prompt="fix env", session_id="sess-1")
             self.assertTrue(res["success"])
-            
+
             sess = self.session_manager.get_session("sess-1")
             self.assertEqual(sess["environment_id"], "env-fresh")
             self.assertEqual(sess["state"], "ACTIVE")
-            
+
             # Verify WorkspaceSync was called for the new environment
             mock_sync.assert_called_once()
             self.assertEqual(mock_sync.call_args[0][0], "env-fresh")
+
+    @patch("workspace_sync.WorkspaceSync.sync_to_remote")
+    @patch("client.requests.post")
+    def test_09_cross_tenant_sync_uses_new_key(self, mock_post, mock_sync):
+        # Test 9: Ensure WorkspaceSync sees the updated session state (new key/tenant) during fallback
+
+        # 1. Setup session on key1 (tenant-A)
+        env = {
+            "AGY_KEY_1": "secret-1", "AGY_TENANT_1": "tenant-A",
+            "AGY_KEY_2": "secret-2", "AGY_TENANT_2": "tenant-B"
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.session_manager.create_session(
+                project_id="proj-1",
+                session_id="sess-1",
+                bound_key="key1",
+                tenant_id="tenant-A",
+                environment_id="env-A"
+            )
+            self.session_manager.update_session("sess-1", state="ACTIVE")
+
+            # 2. Mock Responses: key1 (429) -> key2 (200, new env)
+            resp_429 = MagicMock(status_code=429)
+            resp_429.json.return_value = {"error": {"message": "Rate limit"}}
+
+            resp_200 = MagicMock(status_code=200)
+            resp_200.json.return_value = {
+                "status": "completed",
+                "environment_id": "env-new-B",
+                "id": "int-new-B",
+                "output": "recovered"
+            }
+            mock_post.side_effect = [resp_429, resp_200]
+
+            # 3. WorkspaceSync side effect to verify session state AT CALL TIME
+            def verify_session_at_sync_time(env_id, manifest, overwrite=False):
+                sess = self.session_manager.get_session("sess-1")
+                # CRITICAL: bound_key MUST be key2 BEFORE sync starts
+                if sess["bound_key"] != "key2":
+                    raise ValueError(f"Sync started with wrong bound_key: {sess['bound_key']}")
+                if sess["tenant_id"] != "tenant-B":
+                    raise ValueError(f"Sync started with wrong tenant_id: {sess['tenant_id']}")
+                if sess["environment_id"] != "env-new-B":
+                    raise ValueError(f"Sync started with wrong environment_id: {sess['environment_id']}")
+                return SyncResult(status=SyncStatus.SYNC_SUCCESS, environment_id=env_id)
+
+            mock_sync.side_effect = verify_session_at_sync_time
+
+            client = AntigravityClient(
+                key_pool=self.key_pool,
+                project_id="proj-1",
+                registry=self.registry,
+                session_manager=self.session_manager
+            )
+
+            res = client.create_interaction(prompt="test-9", session_id="sess-1")
+            self.assertTrue(res["success"])
+            self.assertEqual(res["key_ref"], "key2")
+
+            # Verify final state
+            sess = self.session_manager.get_session("sess-1")
+            self.assertEqual(sess["bound_key"], "key2")
+            self.assertEqual(sess["state"], "ACTIVE")
+            self.assertEqual(mock_sync.call_count, 1)
 
 if __name__ == "__main__":
     unittest.main()
