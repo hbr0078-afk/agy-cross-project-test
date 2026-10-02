@@ -32,23 +32,18 @@ class TestRegressionAudit(unittest.TestCase):
             total_size=size
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], None, None)
-        # Mock client to prevent actual network call
-        import workspace_sync
-        class DummyClient:
-            def __init__(self, api_key): pass
-            def create_interaction(self, **kwargs):
-                return {
-                    "success": True,
-                    "status_code": 200,
-                    "output": f"---INTEGRITY_REPORT_START---\nFILE:ok.txt|SIZE:{size}|SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n---INTEGRITY_REPORT_END---"
-                }
-        orig_client = workspace_sync.AntigravityClient
-        workspace_sync.AntigravityClient = DummyClient
-        try:
-            res = self.ws.sync_to_remote("env1", manifest)
-            self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
-        finally:
-            workspace_sync.AntigravityClient = orig_client
+
+        mock_efc = mock.MagicMock()
+        mock_efc.list_all_files.return_value = []
+        mock_efc.upload_file.return_value = {"name": "workspace/ok.txt", "size_bytes": str(size)}
+
+        mock_ver = mock.MagicMock()
+        mock_ver.verify_file.return_value = (True, None)
+
+        with mock.patch("workspace_sync.EnvironmentFileClient", return_value=mock_efc):
+            with mock.patch("workspace_sync.IntegrityVerifier", return_value=mock_ver):
+                res = self.ws.sync_to_remote("env1", manifest)
+                self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
 
     def test_02_single_file_boundary_exact(self):
         """Single file: 512KB exact -> OK"""
@@ -61,22 +56,17 @@ class TestRegressionAudit(unittest.TestCase):
             total_size=size
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], None, None)
-        import workspace_sync
-        class DummyClient:
-            def __init__(self, api_key): pass
-            def create_interaction(self, **kwargs):
-                return {
-                    "success": True,
-                    "status_code": 200,
-                    "output": f"---INTEGRITY_REPORT_START---\nFILE:exact.txt|SIZE:{size}|SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n---INTEGRITY_REPORT_END---"
-                }
-        orig_client = workspace_sync.AntigravityClient
-        workspace_sync.AntigravityClient = DummyClient
-        try:
-            res = self.ws.sync_to_remote("env1", manifest)
-            self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
-        finally:
-            workspace_sync.AntigravityClient = orig_client
+        mock_efc = mock.MagicMock()
+        mock_efc.list_all_files.return_value = []
+        mock_efc.upload_file.return_value = {"name": "workspace/exact.txt", "size_bytes": str(size)}
+
+        mock_ver = mock.MagicMock()
+        mock_ver.verify_file.return_value = (True, None)
+
+        with mock.patch("workspace_sync.EnvironmentFileClient", return_value=mock_efc):
+            with mock.patch("workspace_sync.IntegrityVerifier", return_value=mock_ver):
+                res = self.ws.sync_to_remote("env1", manifest)
+                self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
 
     def test_03_single_file_boundary_plus_one(self):
         """Single file: 512KB + 1 byte -> FILE_TOO_LARGE"""
@@ -110,26 +100,17 @@ class TestRegressionAudit(unittest.TestCase):
             total_size=total_size
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], None, None)
-        import workspace_sync
-        class DummyClient:
-            def __init__(self, api_key): pass
-            def create_interaction(self, **kwargs):
-                report = (
-                    "---INTEGRITY_REPORT_START---\n"
-                    f"FILE:f1.txt|SIZE:{size1}|SHA256:1111111111111111111111111111111111111111111111111111111111111111\n"
-                    f"FILE:f2.txt|SIZE:{size2}|SHA256:2222222222222222222222222222222222222222222222222222222222222222\n"
-                    f"FILE:f3.txt|SIZE:{size3}|SHA256:3333333333333333333333333333333333333333333333333333333333333333\n"
-                    f"FILE:f4.txt|SIZE:{size4}|SHA256:4444444444444444444444444444444444444444444444444444444444444444\n"
-                    "---INTEGRITY_REPORT_END---"
-                )
-                return {"success": True, "status_code": 200, "output": report}
-        orig_client = workspace_sync.AntigravityClient
-        workspace_sync.AntigravityClient = DummyClient
-        try:
-            res = self.ws.sync_to_remote("env1", manifest)
-            self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
-        finally:
-            workspace_sync.AntigravityClient = orig_client
+        mock_efc = mock.MagicMock()
+        mock_efc.list_all_files.return_value = []
+        mock_efc.upload_file.return_value = {"name": "workspace/f1.txt", "size_bytes": str(size1)}
+
+        mock_ver = mock.MagicMock()
+        mock_ver.verify_file.return_value = (True, None)
+
+        with mock.patch("workspace_sync.EnvironmentFileClient", return_value=mock_efc):
+            with mock.patch("workspace_sync.IntegrityVerifier", return_value=mock_ver):
+                res = self.ws.sync_to_remote("env1", manifest)
+                self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
 
     def test_05_total_payload_boundary_exact(self):
         """Total payload: 2MB exact -> OK"""
@@ -147,26 +128,17 @@ class TestRegressionAudit(unittest.TestCase):
             total_size=total_size
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], None, None)
-        import workspace_sync
-        class DummyClient:
-            def __init__(self, api_key): pass
-            def create_interaction(self, **kwargs):
-                report = (
-                    "---INTEGRITY_REPORT_START---\n"
-                    f"FILE:f1.txt|SIZE:{size}|SHA256:1111111111111111111111111111111111111111111111111111111111111111\n"
-                    f"FILE:f2.txt|SIZE:{size}|SHA256:2222222222222222222222222222222222222222222222222222222222222222\n"
-                    f"FILE:f3.txt|SIZE:{size}|SHA256:3333333333333333333333333333333333333333333333333333333333333333\n"
-                    f"FILE:f4.txt|SIZE:{size}|SHA256:4444444444444444444444444444444444444444444444444444444444444444\n"
-                    "---INTEGRITY_REPORT_END---"
-                )
-                return {"success": True, "status_code": 200, "output": report}
-        orig_client = workspace_sync.AntigravityClient
-        workspace_sync.AntigravityClient = DummyClient
-        try:
-            res = self.ws.sync_to_remote("env1", manifest)
-            self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
-        finally:
-            workspace_sync.AntigravityClient = orig_client
+        mock_efc = mock.MagicMock()
+        mock_efc.list_all_files.return_value = []
+        mock_efc.upload_file.return_value = {"name": "workspace/f1.txt", "size_bytes": str(size)}
+
+        mock_ver = mock.MagicMock()
+        mock_ver.verify_file.return_value = (True, None)
+
+        with mock.patch("workspace_sync.EnvironmentFileClient", return_value=mock_efc):
+            with mock.patch("workspace_sync.IntegrityVerifier", return_value=mock_ver):
+                res = self.ws.sync_to_remote("env1", manifest)
+                self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
 
     def test_06_total_payload_boundary_plus_one(self):
         """Total payload: 2MB + 1 byte -> PAYLOAD_TOO_LARGE"""
@@ -229,7 +201,7 @@ class TestRegressionAudit(unittest.TestCase):
             files={"a.txt": {"content": b"hello", "size": 5, "sha256": "123"}}
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], "UNKNOWN_CANNOT_VERIFY", "Forbidden 403")
-        res = self.ws.sync_to_remote("env1", manifest)
+        res = self.ws.sync_to_remote_legacy_interaction("env1", manifest)
         self.assertEqual(res.status, SyncStatus.UNKNOWN_CANNOT_VERIFY)
 
     def test_09_conflict_500_failsafe(self):
@@ -240,7 +212,7 @@ class TestRegressionAudit(unittest.TestCase):
             files={"a.txt": {"content": b"hello", "size": 5, "sha256": "123"}}
         )
         self.ws.check_remote_conflicts = lambda env_id, man: ([], "UNKNOWN_CANNOT_VERIFY", "Internal Server Error 500")
-        res = self.ws.sync_to_remote("env1", manifest)
+        res = self.ws.sync_to_remote_legacy_interaction("env1", manifest)
         self.assertEqual(res.status, SyncStatus.UNKNOWN_CANNOT_VERIFY)
 
 if __name__ == "__main__":
@@ -415,9 +387,9 @@ class TestP3ConflictDetectionSemantics(unittest.TestCase):
             }
         )
         self.ws.check_remote_conflicts = mock.Mock(return_value=(["conflict.txt"], None, None))
-        
+
         # Test that with overwrite=False -> CONFLICT
-        res_fail = self.ws.sync_to_remote("env-test", manifest, overwrite=False)
+        res_fail = self.ws.sync_to_remote_legacy_interaction("env-test", manifest, overwrite=False)
         self.assertEqual(res_fail.status, SyncStatus.CONFLICT)
 
     def test_p3_case_7_no_hash_api_fallback_to_failsafe_path_conflict(self):

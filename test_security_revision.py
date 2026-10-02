@@ -375,7 +375,7 @@ class TestSecurityAndReliabilityRevisions(unittest.TestCase):
         # Mock conflict check returning error
         ws.check_remote_conflicts = lambda env_id, man: ([], "UNKNOWN_CANNOT_VERIFY", "API endpoint error 500")
 
-        res = ws.sync_to_remote("test_env", manifest, overwrite=False)
+        res = ws.sync_to_remote_legacy_interaction("test_env", manifest, overwrite=False)
         self.assertEqual(res.status, SyncStatus.UNKNOWN_CANNOT_VERIFY)
 
     # -------------------------------------------------------------

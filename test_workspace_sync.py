@@ -102,7 +102,7 @@ class TestWorkspaceSync(unittest.TestCase):
 
         self.ws.check_remote_conflicts = lambda env_id, man: (["existing_file.txt"], None)
 
-        res = self.ws.sync_to_remote("test_env", manifest, overwrite=False)
+        res = self.ws.sync_to_remote_legacy_interaction("test_env", manifest, overwrite=False)
         self.assertEqual(res.status, SyncStatus.CONFLICT)
         self.assertIn("existing_file.txt", res.skipped_files)
 
@@ -147,7 +147,7 @@ class TestWorkspaceSync(unittest.TestCase):
         orig_client = workspace_sync.AntigravityClient
         workspace_sync.AntigravityClient = DummyClient
         try:
-            res = self.ws.sync_to_remote("test_env", manifest, overwrite=True)
+            res = self.ws.sync_to_remote_legacy_interaction("test_env", manifest, overwrite=True)
             self.assertEqual(res.status, SyncStatus.VERIFY_FAILED)
         finally:
             workspace_sync.AntigravityClient = orig_client
@@ -194,7 +194,7 @@ class TestWorkspaceSync(unittest.TestCase):
         self.assertIsNone(err)
 
         # 4. Sync to remote environment
-        sync_res = self.ws.sync_to_remote(env_id, manifest, overwrite=True)
+        sync_res = self.ws.sync_to_remote_legacy_interaction(env_id, manifest, overwrite=True)
         self.assertEqual(sync_res.status, SyncStatus.SYNC_SUCCESS, f"Sync failed: {sync_res.error_message}")
 
         # 5. Verify file content on remote via fresh interaction

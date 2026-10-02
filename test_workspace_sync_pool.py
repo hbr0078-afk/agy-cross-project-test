@@ -66,7 +66,7 @@ class TestWorkspaceSyncPool(unittest.TestCase):
 
         ws = WorkspaceSync(key_pool=self.pool)
         self.assertTrue(ws.is_pool_mode)
-        res = ws.sync_to_remote("env_1", self.manifest)
+        res = ws.sync_to_remote_legacy_interaction("env_1", self.manifest)
         self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
         self.assertIn("test.txt", res.verified_files)
 
@@ -228,7 +228,7 @@ class TestWorkspaceSyncPool(unittest.TestCase):
             }
             mock_post.side_effect = [resp_429, resp_200]
 
-            res = ws.sync_to_remote("env_1", self.manifest)
+            res = ws.sync_to_remote_legacy_interaction("env_1", self.manifest)
             self.assertEqual(res.status, SyncStatus.SYNC_SUCCESS)
             self.assertEqual(mock_post.call_count, 2)
             
