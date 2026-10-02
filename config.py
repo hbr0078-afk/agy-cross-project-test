@@ -1,6 +1,7 @@
 """
 Configuration layer for agy-router.
 Supports ~/.agy-router/config.json with environment variable overrides.
+Priority: CLI args > Env vars > Config file > Defaults
 """
 import os
 import json
@@ -29,23 +30,38 @@ class RouterConfig:
     def from_dict(cls, data: Dict[str, Any]) -> 'RouterConfig':
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
-def load_config(config_path: Optional[str] = None) -> RouterConfig:
+class ConfigCorruptedError(Exception):
+    """Raised when the config file is corrupted and cannot be safely parsed."""
+    pass
+
+def load_config(
+    config_path: Optional[str] = None,
+    cli_overrides: Optional[Dict[str, Any]] = None
+) -> RouterConfig:
     """
-    Load configuration from file with environment variable overrides.
+    Load configuration with proper precedence:
     Priority: CLI args > Env vars > Config file > Defaults
+    
+    Args:
+        config_path: Path to config file
+        cli_overrides: Dictionary of CLI-provided values (highest precedence)
     """
     config_file = config_path or DEFAULT_CONFIG_PATH
     config = RouterConfig()
+    cli_overrides = cli_overrides or {}
     
-    # 1. Load from config file if exists
+    # 1. Load from config file if exists (lowest precedence after defaults)
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 file_data = json.load(f)
             config = RouterConfig.from_dict(file_data)
-        except (json.JSONDecodeError, OSError, TypeError):
-            # Ignore corrupted config, use defaults
-            pass
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            # Fail-safe: do not silently ignore corrupted config
+            raise ConfigCorruptedError(
+                f"Config file at '{config_file}' is corrupted or unreadable: {e}. "
+                "Refusing to overwrite with defaults."
+            ) from e
     
     # 2. Apply environment variable overrides
     env_overrides = {
@@ -64,6 +80,11 @@ def load_config(config_path: Optional[str] = None) -> RouterConfig:
                 setattr(config, attr, converter(os.environ[env_var]))
             except (ValueError, TypeError):
                 pass  # Ignore invalid env values
+    
+    # 3. Apply CLI overrides (highest precedence)
+    for attr, value in cli_overrides.items():
+        if hasattr(config, attr) and value is not None:
+            setattr(config, attr, value)
     
     return config
 

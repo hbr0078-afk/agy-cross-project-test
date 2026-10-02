@@ -10,7 +10,7 @@ from sessions import SessionStateManager, SessionCorruptedError
 from git_manager import GitManager, GitState, GitOpStatus
 from snapshot_manager import SnapshotManager
 from workspace_sync import WorkspaceSync
-from config import RouterConfig, load_config, save_config, get_config_path
+from config import RouterConfig, load_config, save_config, get_config_path, ConfigCorruptedError
 
 
 def cmd_test_agent(args):
@@ -306,7 +306,9 @@ def cmd_keypool_discover(args):
 
 
 def cmd_config_show(args):
-    config = load_config(args.config_path)
+    cli_overrides = {}
+    # Add any CLI-specific overrides here
+    config = load_config(args.config_path, cli_overrides)
     path = get_config_path(args.config_path)
     print(f"=== Configuration ({path}) ===")
     print(f"Default Key Index:       {config.default_key_index}")
