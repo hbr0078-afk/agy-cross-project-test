@@ -22,10 +22,10 @@ class RouterConfig:
     log_level: str = "INFO"
     git_auto_checkpoint: bool = True
     default_session_timeout: int = 3600  # 1 hour in seconds
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'RouterConfig':
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
@@ -41,7 +41,7 @@ def load_config(
     """
     Load configuration with proper precedence:
     Priority: CLI args > Env vars > Config file > Defaults
-    
+
     Args:
         config_path: Path to config file
         cli_overrides: Dictionary of CLI-provided values (highest precedence)
@@ -49,7 +49,7 @@ def load_config(
     config_file = config_path or DEFAULT_CONFIG_PATH
     config = RouterConfig()
     cli_overrides = cli_overrides or {}
-    
+
     # 1. Load from config file if exists (lowest precedence after defaults)
     if os.path.exists(config_file):
         try:
@@ -62,7 +62,7 @@ def load_config(
                 f"Config file at '{config_file}' is corrupted or unreadable: {e}. "
                 "Refusing to overwrite with defaults."
             ) from e
-    
+
     # 2. Apply environment variable overrides
     env_overrides = {
         'AGY_DEFAULT_KEY_INDEX': ('default_key_index', int),
@@ -73,19 +73,19 @@ def load_config(
         'AGY_GIT_AUTO_CHECKPOINT': ('git_auto_checkpoint', lambda x: x.lower() in ('true', '1', 'yes')),
         'AGY_DEFAULT_SESSION_TIMEOUT': ('default_session_timeout', int),
     }
-    
+
     for env_var, (attr, converter) in env_overrides.items():
         if env_var in os.environ:
             try:
                 setattr(config, attr, converter(os.environ[env_var]))
             except (ValueError, TypeError):
                 pass  # Ignore invalid env values
-    
+
     # 3. Apply CLI overrides (highest precedence)
     for attr, value in cli_overrides.items():
         if hasattr(config, attr) and value is not None:
             setattr(config, attr, value)
-    
+
     return config
 
 def save_config(config: RouterConfig, config_path: Optional[str] = None) -> bool:

@@ -63,7 +63,7 @@ class TestConfigPrecedence(TestCase):
         }
         with open(self.config_path, 'w') as f:
             json.dump(config_data, f)
-        
+
         config = load_config(self.config_path)
         self.assertEqual(config.default_key_index, 3)
         self.assertEqual(config.cooldown_seconds, 120)
@@ -79,7 +79,7 @@ class TestConfigPrecedence(TestCase):
         }
         with open(self.config_path, 'w') as f:
             json.dump(config_data, f)
-        
+
         with mock.patch.dict(os.environ, {
             'AGY_DEFAULT_KEY_INDEX': '5',
             'AGY_COOLDOWN_SECONDS': '300'
@@ -95,7 +95,7 @@ class TestConfigPrecedence(TestCase):
         }
         with open(self.config_path, 'w') as f:
             json.dump(config_data, f)
-        
+
         with mock.patch.dict(os.environ, {
             'AGY_DEFAULT_KEY_INDEX': '5',
         }):
@@ -107,7 +107,7 @@ class TestConfigPrecedence(TestCase):
         """Corrupted config raises ConfigCorruptedError, not silent fallback"""
         with open(self.config_path, 'w') as f:
             f.write("{ invalid json }")
-        
+
         with self.assertRaises(ConfigCorruptedError):
             load_config(self.config_path)
 
@@ -122,7 +122,7 @@ class TestConfigPrecedence(TestCase):
         """Empty config file uses defaults"""
         with open(self.config_path, 'w') as f:
             f.write("")
-        
+
         with self.assertRaises(ConfigCorruptedError):
             load_config(self.config_path)
 
@@ -133,7 +133,7 @@ class TestConfigPrecedence(TestCase):
         }
         with open(self.config_path, 'w') as f:
             json.dump(config_data, f)
-        
+
         config = load_config(self.config_path)
         self.assertEqual(config.log_level, "WARNING")
         self.assertEqual(config.default_key_index, 1)  # default
@@ -164,11 +164,11 @@ class TestProjectCLI(TestCase):
             "state": "IDLE",
             "roadmap": "ROADMAP.md"
         }
-        
+
         args = mock.MagicMock()
         args.path = "/test/path"
         args.project_id = "test-proj"
-        
+
         # Capture stdout
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
@@ -177,7 +177,7 @@ class TestProjectCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Project ID:  test-proj", output)
         self.assertIn("Local Path:  /test/path", output)
         self.assertIn("GitHub Repo: https://github.com/test/repo", output)
@@ -200,10 +200,10 @@ class TestProjectCLI(TestCase):
             "roadmap": "ROADMAP.md"
         }
         self.mock_registry.find_project_by_path.return_value = None
-        
+
         args = mock.MagicMock()
         args.project_id = "test-proj"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -211,7 +211,7 @@ class TestProjectCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Project ID:     test-proj", output)
         self.assertIn("Local Path:     /test/path", output)
         self.assertIn("GitHub Repo:    https://github.com/test/repo", output)
@@ -230,9 +230,9 @@ class TestProjectCLI(TestCase):
             {"project_id": "proj1", "state": "IDLE", "path": "/path1"},
             {"project_id": "proj2", "state": "ACTIVE", "path": "/path2"},
         ]
-        
+
         args = mock.MagicMock()
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -240,7 +240,7 @@ class TestProjectCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("proj1", output)
         self.assertIn("proj2", output)
         self.assertIn("IDLE", output)
@@ -271,14 +271,14 @@ class TestSessionCLI(TestCase):
             "tenant_id": "tenant-A",
             "state": "IDLE"
         }
-        
+
         args = mock.MagicMock()
         args.project_id = "test-proj"
         args.session_id = "sess_test_123"
         args.bound_key = "key1"
         args.environment_id = "env_1"
         args.tenant_id = "tenant-A"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -286,7 +286,7 @@ class TestSessionCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Session ID:         sess_test_123", output)
         self.assertIn("Project ID:         test-proj", output)
         self.assertIn("Bound Key:          key1", output)
@@ -300,10 +300,10 @@ class TestSessionCLI(TestCase):
             {"session_id": "sess1", "project_id": "proj1", "bound_key": "key1", "tenant_id": "t1", "environment_id": "env1", "state": "ACTIVE"},
             {"session_id": "sess2", "project_id": "proj2", "bound_key": "key2", "tenant_id": "t2", "environment_id": "env2", "state": "IDLE"},
         ]
-        
+
         args = mock.MagicMock()
         args.project_id = None
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -311,7 +311,7 @@ class TestSessionCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("sess1", output)
         self.assertIn("sess2", output)
         self.assertIn("ACTIVE", output)
@@ -330,10 +330,10 @@ class TestSessionCLI(TestCase):
             "created_at": 1234567890,
             "updated_at": 1234567900
         }
-        
+
         args = mock.MagicMock()
         args.session_id = "sess1"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -341,7 +341,7 @@ class TestSessionCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Session ID:         sess1", output)
         self.assertIn("Bound Key:          key1", output)
         self.assertIn("Tenant ID:          t1", output)
@@ -360,7 +360,7 @@ class TestSessionCLI(TestCase):
             "last_interaction_id": "int_456",
             "state": "ACTIVE"
         }
-        
+
         args = mock.MagicMock()
         args.session_id = "sess1"
         args.bound_key = "key2"
@@ -368,7 +368,7 @@ class TestSessionCLI(TestCase):
         args.last_interaction_id = "int_456"
         args.tenant_id = "t1"
         args.state = "ACTIVE"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -376,7 +376,7 @@ class TestSessionCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Session ID:         sess1", output)
         self.assertIn("Bound Key:          key2", output)
         self.assertIn("Environment ID:     env2", output)
@@ -389,10 +389,10 @@ class TestSessionCLI(TestCase):
             "session_id": "sess1",
             "state": "INVALIDATED"
         }
-        
+
         args = mock.MagicMock()
         args.session_id = "sess1"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -400,7 +400,7 @@ class TestSessionCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Session ID: sess1", output)
         self.assertIn("State:      INVALIDATED", output)
 
@@ -423,9 +423,9 @@ class TestKeyPoolCLI(TestCase):
             "key1": {"index": 1, "state": "ACTIVE", "tenant_id": "tenant-A", "fail_count": 0, "last_used_at": 0},
             "key2": {"index": 2, "state": "COOLDOWN", "tenant_id": "tenant-B", "fail_count": 1, "last_used_at": 1234567890},
         }
-        
+
         args = mock.MagicMock()
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -433,7 +433,7 @@ class TestKeyPoolCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("key1", output)
         self.assertIn("key2", output)
         self.assertIn("ACTIVE", output)
@@ -450,9 +450,9 @@ class TestKeyPoolCLI(TestCase):
                 "last_used_at": 1234567890, "last_success_at": 1234567890
             }
         }
-        
+
         args = mock.MagicMock()
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -460,7 +460,7 @@ class TestKeyPoolCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Key: key1", output)
         self.assertIn("State:         ACTIVE", output)
         self.assertIn("Tenant:        tenant-A", output)
@@ -470,10 +470,10 @@ class TestKeyPoolCLI(TestCase):
     def test_keypool_reset(self):
         """key-pool reset works"""
         self.mock_kp.reset_key.return_value = True
-        
+
         args = mock.MagicMock()
         args.key_ref = "key1"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -481,16 +481,16 @@ class TestKeyPoolCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Key 'key1' reset to ACTIVE", output)
 
     def test_keypool_discover(self):
         """key-pool discover works"""
         self.mock_kp.discover_keys.return_value = [1, 2, 3]
-        
+
         with mock.patch('cli.get_api_key_by_index', side_effect=lambda i: f"key_{i}_value" if i <= 3 else ""):
             args = mock.MagicMock()
-            
+
             old_stdout = sys.stdout
             sys.stdout = captured = StringIO()
             try:
@@ -498,7 +498,7 @@ class TestKeyPoolCLI(TestCase):
                 output = captured.getvalue()
             finally:
                 sys.stdout = old_stdout
-        
+
         self.assertIn("Discovered API keys", output)
         self.assertIn("Key 1", output)
         self.assertIn("Key 2", output)
@@ -521,7 +521,7 @@ class TestConfigCLI(TestCase):
         """config init creates default config"""
         args = mock.MagicMock()
         args.config_path = self.config_path
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -529,10 +529,10 @@ class TestConfigCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Default configuration created", output)
         self.assertTrue(os.path.exists(self.config_path))
-        
+
         with open(self.config_path) as f:
             data = json.load(f)
         self.assertEqual(data["default_key_index"], 1)
@@ -543,10 +543,10 @@ class TestConfigCLI(TestCase):
         config_data = {"default_key_index": 2, "log_level": "DEBUG"}
         with open(self.config_path, 'w') as f:
             json.dump(config_data, f)
-        
+
         args = mock.MagicMock()
         args.config_path = self.config_path
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -554,7 +554,7 @@ class TestConfigCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Default Key Index:       2", output)
         self.assertIn("Log Level:               DEBUG", output)
 
@@ -564,7 +564,7 @@ class TestConfigCLI(TestCase):
         args.config_path = self.config_path
         args.key = "default_key_index"
         args.value = "5"
-        
+
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
         try:
@@ -572,9 +572,9 @@ class TestConfigCLI(TestCase):
             output = captured.getvalue()
         finally:
             sys.stdout = old_stdout
-        
+
         self.assertIn("Config 'default_key_index' set to '5'", output)
-        
+
         with open(self.config_path) as f:
             data = json.load(f)
         self.assertEqual(data["default_key_index"], 5)
@@ -590,7 +590,7 @@ class TestSecurityNoRawKeys(TestCase):
         mock_kp = mock.MagicMock()
         mock_kp_class.return_value = mock_kp
         mock_kp.get_status.return_value = {"key1": {"index": 1, "state": "ACTIVE", "tenant_id": "", "fail_count": 0, "last_used_at": 0}}
-        
+
         try:
             args = mock.MagicMock()
             old_stdout = sys.stdout
@@ -600,7 +600,7 @@ class TestSecurityNoRawKeys(TestCase):
                 output = captured.getvalue()
             finally:
                 sys.stdout = old_stdout
-            
+
             # Should show key references (key1, key2) not raw values
             self.assertIn("key1", output)
             self.assertNotIn("AIza", output)
