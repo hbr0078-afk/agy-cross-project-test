@@ -205,7 +205,8 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
 
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key10")
-            self.assertEqual(registry.get_project("project-A")["active_key"], "key10")
+            # In Phase 7+, ProjectRegistry retains static metadata only and does not store active_key
+            self.assertNotIn("active_key", registry.get_project("project-A") or {})
 
             status = pool.get_status()
             for i in range(1, 10):

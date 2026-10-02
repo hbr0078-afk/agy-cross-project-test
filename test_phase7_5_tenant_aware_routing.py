@@ -247,6 +247,47 @@ class TestPhase7_5TenantAwareRouting(unittest.TestCase):
             self.assertNotIn("environment_id", proj_entry)
             self.assertNotIn("last_interaction_id", proj_entry)
 
+    @patch("workspace_sync.WorkspaceSync.sync_to_remote")
+    @patch("client.requests.post")
+    def test_I_legacy_non_session_runtime_state_isolation(self, mock_post, mock_sync):
+        """Test I: Legacy/non-session pool mode (session_manager=None) MUST NOT write runtime state to projects.json."""
+        env = {
+            "AGY_KEY_1": "secret-1", "AGY_TENANT_1": "tenant-A",
+            "AGY_KEY_2": "secret-2", "AGY_TENANT_2": "tenant-A",
+        }
+        mock_sync.return_value = SyncResult(status=SyncStatus.SYNC_SUCCESS, environment_id="env-legacy")
+
+        r429 = MagicMock(status_code=429)
+        r429.json.return_value = {"error": "rate limit"}
+
+        r200 = MagicMock(status_code=200)
+        r200.json.return_value = {"id": "int-legacy", "environment_id": "env-legacy", "output": "ok"}
+
+        mock_post.side_effect = [r429, r200]
+
+        with patch.dict(os.environ, env, clear=True):
+            pool = self._make_key_pool()
+            reg = self._make_registry()
+
+            pdir = os.path.join(self.test_dir.name, "proj")
+            os.makedirs(pdir, exist_ok=True)
+            reg.register_project(pdir, project_id="proj-legacy")
+
+            # Client with session_manager=None (Legacy/non-session mode)
+            client = AntigravityClient(key_pool=pool, project_id="proj-legacy", registry=reg, session_manager=None)
+            res = client.create_interaction("prompt")
+
+            self.assertTrue(res["success"])
+
+            # Check raw projects.json on disk
+            with open(self.projects_path, "r", encoding="utf-8") as f:
+                disk_data = json.load(f)
+
+            proj_entry = disk_data["projects"]["proj-legacy"]
+            self.assertNotIn("active_key", proj_entry)
+            self.assertNotIn("environment_id", proj_entry)
+            self.assertNotIn("last_interaction_id", proj_entry)
+
     def test_H_concurrent_tenant_aware_selection(self):
         """Test H: Concurrent multi-threaded tenant-aware key selection to ensure no deadlock, no duplicate invalid binding, no corrupted JSON."""
         env = {

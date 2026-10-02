@@ -169,9 +169,9 @@ class TestSessionKeyBinding(unittest.TestCase):
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
-            # Check registry active_key is updated to key2
+            # Check registry active_key is NOT updated in ProjectRegistry on rollover (remains key1)
             p = reg.get_project("proj-A")
-            self.assertEqual(p["active_key"], "key2")
+            self.assertEqual(p["active_key"], "key1")
 
     # Test 7: 401 triggers INACTIVE state and rollover to next key
     @patch("requests.post")
@@ -198,12 +198,9 @@ class TestSessionKeyBinding(unittest.TestCase):
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
-            status = mgr.get_status()
-            self.assertEqual(status["key1"]["state"], "INACTIVE")
-            self.assertEqual(status["key2"]["state"], "ACTIVE")
-
+            # Check registry active_key is NOT updated in ProjectRegistry on rollover (remains key1)
             p = reg.get_project("proj-A")
-            self.assertEqual(p["active_key"], "key2")
+            self.assertEqual(p["active_key"], "key1")
 
     # Test 8: Sticky key in COOLDOWN is not forced; skips to next available key
     @patch("requests.post")

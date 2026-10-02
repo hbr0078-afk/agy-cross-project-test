@@ -280,8 +280,10 @@ class AntigravityClient:
                 new_env_id = result.get("environment_id")
                 interaction_id = result.get("interaction_id")
                 
-                # Update session/registry state BEFORE Sync (Phase 7-4 fix)
-                # This ensures WorkspaceSync uses the new key/tenant context.
+                # Update session state BEFORE Sync (Phase 7-4 fix)
+                # In session mode, SessionStateManager is the single source of truth for runtime state.
+                # In non-session / legacy mode, ProjectRegistry remains static project metadata ONLY
+                # and must NEVER store runtime fields (active_key, environment_id, last_interaction_id).
                 if session_id and self.session_manager:
                     try:
                         self.session_manager.update_session(
@@ -291,16 +293,6 @@ class AntigravityClient:
                             environment_id=new_env_id,
                             last_interaction_id=interaction_id,
                             state="ACTIVE"
-                        )
-                    except Exception: pass
-                elif project_id and self.registry:
-                    # Non-session mode (Phase 6-4 legacy mode): update project state in registry
-                    try:
-                        self.registry.update_project_state(
-                            project_id=project_id,
-                            active_key=key_ref,
-                            environment_id=new_env_id,
-                            last_interaction_id=interaction_id
                         )
                     except Exception: pass
 
