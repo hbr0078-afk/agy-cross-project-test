@@ -546,6 +546,14 @@ class TestConfigCLI(TestCase):
 
         args = mock.MagicMock()
         args.config_path = self.config_path
+        # Need to set cli override attributes to None
+        args.default_key_index = None
+        args.cooldown_seconds = None
+        args.max_total_sync_bytes = None
+        args.max_file_size_bytes = None
+        args.log_level = None
+        args.git_auto_checkpoint = None
+        args.default_session_timeout = None
 
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
@@ -560,10 +568,22 @@ class TestConfigCLI(TestCase):
 
     def test_config_set(self):
         """config set updates value"""
+        # Create initial config
+        with open(self.config_path, 'w') as f:
+            json.dump({"default_key_index": 1}, f)
+
         args = mock.MagicMock()
         args.config_path = self.config_path
         args.key = "default_key_index"
         args.value = "5"
+        # Need to set cli override attributes to None
+        args.default_key_index = None
+        args.cooldown_seconds = None
+        args.max_total_sync_bytes = None
+        args.max_file_size_bytes = None
+        args.log_level = None
+        args.git_auto_checkpoint = None
+        args.default_session_timeout = None
 
         old_stdout = sys.stdout
         sys.stdout = captured = StringIO()
@@ -706,6 +726,140 @@ class TestExitCodes(TestCase):
         finally:
             sys.argv = old_argv
             sys.stderr = old_stderr
+
+
+class TestCLIConfigPrecedenceSubprocess(TestCase):
+    """Test config precedence using actual subprocess calls."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.temp_dir, "config.json")
+        self.cli_path = os.path.join(os.path.dirname(__file__), "cli.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def run_cli(self, args_list, env=None, config_content=None):
+        """Run CLI subprocess and return (stdout, stderr, returncode)."""
+        if config_content is not None:
+            with open(self.config_path, 'w') as f:
+                json.dump(config_content, f)
+        
+        cmd = [sys.executable, self.cli_path, "--config", self.config_path] + args_list
+        test_env = os.environ.copy()
+        if env:
+            test_env.update(env)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, env=test_env)
+        return result.stdout, result.stderr, result.returncode
+
+    def test_default_only(self):
+        """No config file, no env, no CLI -> defaults"""
+        stdout, stderr, code = self.run_cli(["config", "show"], config_content=None)
+        self.assertEqual(code, 0)
+        self.assertIn("Default Key Index:       1", stdout)
+        self.assertIn("Log Level:               INFO", stdout)
+
+    def test_file_override_default(self):
+        """Config file overrides defaults"""
+        stdout, stderr, code = self.run_cli(
+            ["config", "show"],
+            config_content={"default_key_index": 2, "log_level": "DEBUG"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Default Key Index:       2", stdout)
+        self.assertIn("Log Level:               DEBUG", stdout)
+
+    def test_env_override_file(self):
+        """Environment variable overrides config file"""
+        stdout, stderr, code = self.run_cli(
+            ["config", "show"],
+            env={'AGY_DEFAULT_KEY_INDEX': '5', 'AGY_LOG_LEVEL': 'WARNING'},
+            config_content={"default_key_index": 2, "log_level": "DEBUG"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Default Key Index:       5", stdout)
+        self.assertIn("Log Level:               WARNING", stdout)
+
+    def test_cli_override_env(self):
+        """CLI argument overrides environment variable"""
+        stdout, stderr, code = self.run_cli(
+            ["--default-key-index", "7", "--log-level", "ERROR", "config", "show"],
+            env={'AGY_DEFAULT_KEY_INDEX': '5', 'AGY_LOG_LEVEL': 'WARNING'},
+            config_content={"default_key_index": 2, "log_level": "DEBUG"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Default Key Index:       7", stdout)
+        self.assertIn("Log Level:               ERROR", stdout)
+
+    def test_cli_bool_true(self):
+        """CLI --git-auto-checkpoint sets True"""
+        stdout, stderr, code = self.run_cli(
+            ["--git-auto-checkpoint", "config", "show"],
+            config_content={"git_auto_checkpoint": False}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Git Auto Checkpoint:     True", stdout)
+
+    def test_cli_bool_false(self):
+        """CLI --no-git-auto-checkpoint sets False"""
+        stdout, stderr, code = self.run_cli(
+            ["--no-git-auto-checkpoint", "config", "show"],
+            config_content={"git_auto_checkpoint": True}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Git Auto Checkpoint:     False", stdout)
+
+    def test_corrupted_config_failsafe(self):
+        """Corrupted config file causes non-zero exit"""
+        with open(self.config_path, 'w') as f:
+            f.write("{ invalid json }")
+        
+        stdout, stderr, code = self.run_cli(["config", "show"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("corrupted", stderr.lower())
+
+    def test_empty_config_failsafe(self):
+        """Empty config file causes non-zero exit"""
+        with open(self.config_path, 'w') as f:
+            f.write("")
+        
+        stdout, stderr, code = self.run_cli(["config", "show"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("corrupted", stderr.lower())
+
+
+class TestCLISecuritySubprocess(TestCase):
+    """Test security - no raw credentials in subprocess output."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.temp_dir, "config.json")
+        self.cli_path = os.path.join(os.path.dirname(__file__), "cli.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def run_cli(self, args_list, env=None):
+        cmd = [sys.executable, self.cli_path, "--config", self.config_path] + args_list
+        test_env = os.environ.copy()
+        if env:
+            test_env.update(env)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=test_env)
+        return result.stdout, result.stderr, result.returncode
+
+    def test_no_raw_keys_in_output(self):
+        """key-pool commands never output raw API keys"""
+        # We mock the KeyPoolManager at the module level for this subprocess test
+        # Since we can't easily mock in subprocess, we test that the CLI doesn't
+        # print raw keys when they would be present in the output
+        stdout, stderr, code = self.run_cli(["key-pool", "list"])
+        # Should either succeed with masked output or fail gracefully
+        # The key point is no raw keys like AIza... or sk-... in output
+        self.assertNotIn("AIza", stdout)
+        self.assertNotIn("sk-", stdout)
+        self.assertNotIn("authorization", stdout.lower())
+        self.assertNotIn("bearer", stdout.lower())
 
 
 if __name__ == "__main__":

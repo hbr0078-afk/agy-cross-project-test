@@ -305,10 +305,32 @@ def cmd_keypool_discover(args):
         sys.exit(1)
 
 
+def _build_cli_overrides(args) -> dict:
+    """Build cli_overrides dict from parsed args."""
+    overrides = {}
+    # Map CLI arg names to config attribute names
+    mapping = {
+        'default_key_index': args.default_key_index,
+        'cooldown_seconds': args.cooldown_seconds,
+        'max_total_sync_bytes': args.max_total_sync_bytes,
+        'max_file_size_bytes': args.max_file_size_bytes,
+        'log_level': args.log_level,
+        'git_auto_checkpoint': args.git_auto_checkpoint,
+        'default_session_timeout': args.default_session_timeout,
+    }
+    for key, value in mapping.items():
+        if value is not None:
+            overrides[key] = value
+    return overrides
+
+
 def cmd_config_show(args):
-    cli_overrides = {}
-    # Add any CLI-specific overrides here
-    config = load_config(args.config_path, cli_overrides)
+    cli_overrides = _build_cli_overrides(args)
+    try:
+        config = load_config(args.config_path, cli_overrides)
+    except ConfigCorruptedError as e:
+        print(f"[!] Error: {e}", file=sys.stderr)
+        sys.exit(1)
     path = get_config_path(args.config_path)
     print(f"=== Configuration ({path}) ===")
     print(f"Default Key Index:       {config.default_key_index}")
@@ -322,7 +344,12 @@ def cmd_config_show(args):
 
 
 def cmd_config_set(args):
-    config = load_config(args.config_path)
+    cli_overrides = _build_cli_overrides(args)
+    try:
+        config = load_config(args.config_path, cli_overrides)
+    except ConfigCorruptedError as e:
+        print(f"[!] Error: {e}", file=sys.stderr)
+        sys.exit(1)
     try:
         # Update the specified field
         if hasattr(config, args.key):
@@ -506,6 +533,17 @@ def cmd_snapshot_restore(args):
 def main():
     parser = argparse.ArgumentParser(prog="agy-router", description="Antigravity Multi-Key Router")
     parser.add_argument("--config", dest="config_path", type=str, default=None, help="Path to config file (default: ~/.agy-router/config.json)")
+    
+    # Root-level config override arguments (CLI > ENV > FILE > DEFAULT)
+    parser.add_argument("--default-key-index", type=int, default=None, help="Override default_key_index")
+    parser.add_argument("--cooldown-seconds", type=int, default=None, help="Override cooldown_seconds")
+    parser.add_argument("--max-total-sync-bytes", type=int, default=None, help="Override max_total_sync_bytes")
+    parser.add_argument("--max-file-size-bytes", type=int, default=None, help="Override max_file_size_bytes")
+    parser.add_argument("--log-level", type=str, default=None, help="Override log_level")
+    parser.add_argument("--git-auto-checkpoint", action="store_true", default=None, help="Override git_auto_checkpoint to True")
+    parser.add_argument("--no-git-auto-checkpoint", action="store_false", dest="git_auto_checkpoint", help="Override git_auto_checkpoint to False")
+    parser.add_argument("--default-session-timeout", type=int, default=None, help="Override default_session_timeout")
+    
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
     # test-agent
@@ -582,17 +620,14 @@ def main():
     config_sub = config_parser.add_subparsers(dest="config_cmd", help="Config commands")
     
     c_show = config_sub.add_parser("show", help="Show current configuration")
-    c_show.add_argument("--config-path", type=str, default=None, help="Config file path")
     c_show.set_defaults(func=cmd_config_show)
     
     c_set = config_sub.add_parser("set", help="Set a configuration value")
     c_set.add_argument("key", type=str, help="Config key")
     c_set.add_argument("value", type=str, help="Config value")
-    c_set.add_argument("--config-path", type=str, default=None, help="Config file path")
     c_set.set_defaults(func=cmd_config_set)
     
     c_init = config_sub.add_parser("init", help="Create default config file")
-    c_init.add_argument("--config-path", type=str, default=None, help="Config file path")
     c_init.set_defaults(func=cmd_config_init)
 
     # git
