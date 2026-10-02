@@ -5,6 +5,7 @@ import fcntl
 import time
 from typing import Dict, Any, Optional, List
 from file_lock import FileAndThreadLock
+from observability import (log_session_created, log_session_activated, log_session_invalidated, log_session_reset)
 
 
 DEFAULT_SESSION_DIR = os.path.expanduser("~/.agy-router")
@@ -118,6 +119,7 @@ class SessionStateManager:
             }
             data["sessions"][sid] = entry
             self.save(data)
+            log_session_created(sid, project_id, bound_key or "key1", tenant_id or None, environment_id or None)
             return entry
 
         return self._with_lock(_tx)
@@ -148,6 +150,7 @@ class SessionStateManager:
                 raise KeyError(f"Session '{session_id}' not found in storage.")
 
             s = data["sessions"][session_id]
+            old_state = s.get("state", "IDLE")
             if bound_key is not None:
                 s["bound_key"] = bound_key
             if environment_id is not None:
@@ -164,12 +167,24 @@ class SessionStateManager:
 
             data["sessions"][session_id] = s
             self.save(data)
+            
+            # Log session state changes
+            if state == "ACTIVE" and old_state != "ACTIVE":
+                log_session_activated(session_id, s["project_id"], s["bound_key"], s.get("tenant_id"), s.get("environment_id"), s.get("last_interaction_id"))
+            elif state == "INVALIDATED":
+                log_session_invalidated(session_id, s["project_id"], f"state_change_to_{state}")
+            elif state == "IDLE" and old_state == "INVALIDATED":
+                log_session_reset(session_id, s["project_id"], "state_reset_to_idle")
+            
             return s
 
         return self._with_lock(_tx)
 
     def invalidate_session(self, session_id: str) -> Dict[str, Any]:
         """Explicitly invalidates a session on tenant mismatch, 404, or environment loss."""
+        session = self.get_session(session_id)
+        if session:
+            log_session_invalidated(session_id, session["project_id"], "explicit_invalidate")
         return self.update_session(session_id=session_id, state="INVALIDATED")
 
     def delete_session(self, session_id: str) -> bool:

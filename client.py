@@ -1,7 +1,9 @@
 import json
 import requests
+import time
 from typing import Dict, Any, Optional
 from keys import KeyPoolManager, AllKeysExhaustedError, get_api_key_by_index
+from observability import (log_interaction_start, log_interaction_success, log_interaction_failure, log_key_rollover, log_recovery_same_tenant, log_recovery_cross_tenant, log_recovery_environment_reset, log_recovery_interaction_reset, log_recovery_workspace_sync)
 
 API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 AGENT_NAME = "antigravity-preview-05-2026"
@@ -261,6 +263,8 @@ class AntigravityClient:
                 current_tenant = chosen_tenant
 
             # 3. Execute Request
+            start_time = time.time()
+            log_interaction_start(project_id or "", session_id or "", key_ref, chosen_tenant, current_env_id)
             result = self._execute_request(
                 api_key=raw_key,
                 prompt=prompt,
@@ -269,6 +273,7 @@ class AntigravityClient:
                 previous_interaction_id=current_prev_id,
                 timeout=timeout,
             )
+            duration_ms = int((time.time() - start_time) * 1000)
             result["key_ref"] = key_ref
             result["key_index"] = key_idx
             last_result = result
@@ -279,6 +284,7 @@ class AntigravityClient:
                 self._key_pool.report_result(key_ref, status_code=200)
                 new_env_id = result.get("environment_id")
                 interaction_id = result.get("interaction_id")
+                log_interaction_success(project_id or "", session_id or "", key_ref, chosen_tenant, new_env_id or "", interaction_id or "", status_code, duration_ms)
                 
                 # Update session state BEFORE Sync (Phase 7-4 fix)
                 # In session mode, SessionStateManager is the single source of truth for runtime state.
@@ -298,14 +304,17 @@ class AntigravityClient:
 
                 # If environment changed (e.g. fresh environment provisioned due to fallback)
                 if new_env_id and new_env_id != environment_id and project_id and self.registry:
+                    log_recovery_workspace_sync(session_id or "", project_id or "", new_env_id, "environment_changed")
                     self._sync_project_to_environment(new_env_id, project_id, session_id)
 
                 return result
 
             # 5. Handle 404 (Environment or Interaction missing)
             if status_code == 404:
+                log_interaction_failure(project_id or "", session_id or "", key_ref, chosen_tenant, current_env_id, "ENVIRONMENT_OR_INTERACTION_NOT_FOUND", status_code, duration_ms)
                 if current_prev_id:
                     # Case A: Interaction lost but environment might be fine -> reset interaction_id and retry
+                    log_recovery_interaction_reset(session_id or "", project_id or "", "INTERACTION_404", current_prev_id)
                     current_prev_id = None
                     attempts -= 1
                     continue
@@ -313,6 +322,7 @@ class AntigravityClient:
                     # Case B: Environment lost or Cross-Tenant 은폐형 404 -> reset environment_id and retry fresh
                     if session_id and self.session_manager:
                         self.session_manager.invalidate_session(session_id)
+                    log_recovery_environment_reset(session_id or "", project_id or "", "ENVIRONMENT_404", current_env_id)
                     current_env_id = None
                     current_tenant = chosen_tenant
                     attempts -= 1
@@ -320,21 +330,31 @@ class AntigravityClient:
 
             # 6. Handle Rollover (429, 401, 403)
             if status_code in (429, 401, 403):
+                log_interaction_failure(project_id or "", session_id or "", key_ref, chosen_tenant, current_env_id, f"HTTP_{status_code}", status_code, duration_ms)
+                if status_code in (429, 401):
+                    log_key_rollover(key_ref, "NEXT_AVAILABLE_KEY", f"HTTP_{status_code}", chosen_tenant, project_id, session_id)
+                    if current_tenant and chosen_tenant and current_tenant != chosen_tenant:
+                        log_recovery_cross_tenant(session_id or "", project_id or "", current_tenant, chosen_tenant, f"HTTP_{status_code}")
+                    elif current_tenant == chosen_tenant:
+                        log_recovery_same_tenant(session_id or "", project_id or "", key_ref, "NEXT_AVAILABLE_KEY", f"HTTP_{status_code}")
                 self._key_pool.report_result(key_ref, status_code=status_code, error_data=result.get("error"))
                 excluded_keys.add(key_ref)
                 continue
 
             # 7. Handle Transient Errors (5xx, Network)
             if status_code is None or status_code == 0 or status_code >= 500:
+                log_interaction_failure(project_id or "", session_id or "", key_ref, chosen_tenant, current_env_id, "TRANSIENT_ERROR", status_code, duration_ms)
                 if key_ref not in same_key_retried:
                     same_key_retried.add(key_ref)
                     attempts -= 1
                     continue
+                log_key_rollover(key_ref, "NEXT_AVAILABLE_KEY", "TRANSIENT_ERROR", chosen_tenant, project_id, session_id)
                 self._key_pool.report_result(key_ref, status_code=status_code)
                 excluded_keys.add(key_ref)
                 continue
 
             # Default client error
+            log_interaction_failure(project_id or "", session_id or "", key_ref, chosen_tenant, current_env_id, "CLIENT_ERROR", status_code, duration_ms)
             self._key_pool.report_result(key_ref, status_code=status_code)
             return result
 

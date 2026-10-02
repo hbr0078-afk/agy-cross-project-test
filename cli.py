@@ -11,6 +11,7 @@ from git_manager import GitManager, GitState, GitOpStatus
 from snapshot_manager import SnapshotManager
 from workspace_sync import WorkspaceSync
 from config import RouterConfig, load_config, save_config, get_config_path, ConfigCorruptedError
+from observability import (configure_logging, check_health, get_diagnostics, format_diagnostics_text)
 
 
 def cmd_test_agent(args):
@@ -530,6 +531,27 @@ def cmd_snapshot_restore(args):
         sys.exit(1)
 
 
+def cmd_health(args):
+    health = check_health(args.config_path)
+    print("=== agy-router Health ===")
+    print()
+    for check, status in health["checks"].items():
+        print(f"{check}: {status}")
+    print()
+    print(f"Overall: {health['overall']}")
+    if not health["healthy"]:
+        sys.exit(1)
+
+
+def cmd_diagnostics(args):
+    diagnostics = get_diagnostics(args.config_path)
+    if args.json:
+        import json
+        print(json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(format_diagnostics_text(diagnostics))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="agy-router", description="Antigravity Multi-Key Router")
     parser.add_argument("--config", dest="config_path", type=str, default=None, help="Path to config file (default: ~/.agy-router/config.json)")
@@ -679,10 +701,27 @@ def main():
     s_rst.add_argument("destination", type=str, help="Destination directory path")
     s_rst.set_defaults(func=cmd_snapshot_restore)
 
+    # health
+    health_parser = subparsers.add_parser("health", help="Check router health (local storage and configuration only)")
+    health_parser.set_defaults(func=cmd_health)
+
+    # diagnostics
+    diag_parser = subparsers.add_parser("diagnostics", help="Show runtime diagnostics overview")
+    diag_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    diag_parser.set_defaults(func=cmd_diagnostics)
+
     args = parser.parse_args()
     if not hasattr(args, "func"):
         parser.print_help()
         sys.exit(1)
+
+    # Configure logging based on config
+    try:
+        cli_overrides = _build_cli_overrides(args)
+        config = load_config(args.config_path, cli_overrides)
+        configure_logging(config.log_level, json_output=(hasattr(args, 'json') and args.json))
+    except Exception:
+        configure_logging()
 
     args.func(args)
 

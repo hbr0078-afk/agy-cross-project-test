@@ -6,6 +6,7 @@ import fcntl
 import tempfile
 from typing import Dict, Any, Optional, List, Tuple
 from file_lock import FileAndThreadLock
+from observability import (log_key_selected, log_key_rollover, log_key_cooldown, log_key_inactive)
 
 
 DEFAULT_KEY_STORAGE_DIR = os.path.expanduser("~/.agy-router")
@@ -293,6 +294,8 @@ class KeyPoolManager:
             keys_dict[chosen_ref]["last_used_at"] = now
             self._save_raw(data)
 
+            log_key_selected(chosen_ref, keys_dict[chosen_ref].get("tenant_id") or None)
+
             return chosen_ref, keys_dict[chosen_ref]["index"]
 
         return self._with_lock(_tx)
@@ -348,12 +351,14 @@ class KeyPoolManager:
                 entry["state"] = "COOLDOWN"
                 entry["fail_count"] += 1
                 entry["cooldown_until"] = now + self.cooldown_seconds
+                log_key_cooldown(key_ref, self.cooldown_seconds, "RATE_LIMIT_429", entry.get("tenant_id"))
 
             # 3. Invalid credentials (401)
             elif status_code == 401:
                 entry["state"] = "INACTIVE"
                 entry["fail_count"] += 1
                 entry["cooldown_until"] = None
+                log_key_inactive(key_ref, "INVALID_CREDENTIALS_401", entry.get("tenant_id"))
 
             # 4. Forbidden (403) - do NOT blindly mark INACTIVE
             elif status_code == 403:
@@ -361,6 +366,7 @@ class KeyPoolManager:
                 if entry["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD:
                     entry["state"] = "COOLDOWN"
                     entry["cooldown_until"] = now + self.cooldown_seconds
+                    log_key_cooldown(key_ref, self.cooldown_seconds, "FORBIDDEN_403_THRESHOLD", entry.get("tenant_id"))
 
             # 5. Server errors (5xx)
             elif status_code in (500, 502, 503, 504):
@@ -368,6 +374,7 @@ class KeyPoolManager:
                 if entry["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD:
                     entry["state"] = "COOLDOWN"
                     entry["cooldown_until"] = now + self.cooldown_seconds
+                    log_key_cooldown(key_ref, self.cooldown_seconds, f"SERVER_ERROR_{status_code}_THRESHOLD", entry.get("tenant_id"))
 
             # 6. Timeout / Network error (status_code is None or 0)
             elif status_code is None or status_code == 0:
@@ -375,6 +382,7 @@ class KeyPoolManager:
                 if entry["fail_count"] >= CONSECUTIVE_FAILURE_THRESHOLD:
                     entry["state"] = "COOLDOWN"
                     entry["cooldown_until"] = now + self.cooldown_seconds
+                    log_key_cooldown(key_ref, self.cooldown_seconds, "NETWORK_ERROR_THRESHOLD", entry.get("tenant_id"))
 
             # 7. 400 and other client errors: no rotation penalty
             else:
