@@ -747,7 +747,7 @@ def check_health(
     results = {}
     overall_healthy = True
     
-    # Check config.json
+    # Check config.json (optional - defaults used if missing)
     config_file = get_config_path(config_path)
     try:
         if os.path.exists(config_file):
@@ -755,7 +755,7 @@ def check_health(
                 json.load(f)
             results["config.json"] = "OK"
         else:
-            results["config.json"] = "NOT_FOUND"
+            results["config.json"] = "NOT_FOUND (using defaults)"
     except Exception as e:
         results["config.json"] = f"ERROR: {e}"
         overall_healthy = False
@@ -769,10 +769,11 @@ def check_health(
             results["projects.json"] = "OK"
         else:
             results["projects.json"] = "NOT_FOUND"
+            overall_healthy = False
     except Exception as e:
         results["projects.json"] = f"ERROR: {e}"
         overall_healthy = False
-    
+     
     # Check key_states.json
     keys_file = keys_path or DEFAULT_KEY_STATE_PATH
     try:
@@ -782,10 +783,11 @@ def check_health(
             results["key_states.json"] = "OK"
         else:
             results["key_states.json"] = "NOT_FOUND"
+            overall_healthy = False
     except Exception as e:
         results["key_states.json"] = f"ERROR: {e}"
         overall_healthy = False
-    
+     
     # Check sessions.json
     sessions_file = sessions_path or DEFAULT_SESSION_PATH
     try:
@@ -795,6 +797,7 @@ def check_health(
             results["sessions.json"] = "OK"
         else:
             results["sessions.json"] = "NOT_FOUND"
+            overall_healthy = False
     except Exception as e:
         results["sessions.json"] = f"ERROR: {e}"
         overall_healthy = False
