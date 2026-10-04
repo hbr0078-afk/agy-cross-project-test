@@ -105,36 +105,40 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             pool = self._make_key_pool()
             registry = self._make_registry()
+            from sessions import SessionStateManager
+            sess_mgr = SessionStateManager(storage_path=os.path.join(self.test_dir.name, "sessions.json"))
 
             # Create & register 5 projects
             project_ids = ["project-A", "project-B", "project-C", "project-D", "project-E"]
             clients = {}
+            session_ids = {}
             for idx, pid in enumerate(project_ids, start=1):
                 pdir = os.path.join(self.test_dir.name, pid)
                 os.makedirs(pdir, exist_ok=True)
                 registry.register_project(pdir, project_id=pid)
-                # Assign initial binding: A->key1, B->key2, C->key3, D->key4, E->key5
-                registry.update_project_state(pid, active_key=f"key{idx}")
-                clients[pid] = AntigravityClient(key_pool=pool, project_id=pid, registry=registry)
+                # Assign initial binding via session bound_key (Phase 7-2 contract)
+                sess = sess_mgr.create_session(pid, bound_key=f"key{idx}")
+                session_ids[pid] = sess["session_id"]
+                clients[pid] = AntigravityClient(key_pool=pool, project_id=pid, registry=registry, session_manager=sess_mgr)
 
             # Perform 3 consecutive interactions per project
             for _ in range(3):
                 for pid in project_ids:
-                    res = clients[pid].create_interaction(prompt=f"req for {pid}")
+                    res = clients[pid].create_interaction(prompt=f"req for {pid}", session_id=session_ids[pid])
                     self.assertTrue(res["success"])
                     expected_key = f"key{project_ids.index(pid) + 1}"
                     self.assertEqual(res["key_ref"], expected_key)
 
-            # Re-verify registry bindings remained stable
+            # Re-verify projects.json has NO runtime fields (Phase 7-2 contract)
             for idx, pid in enumerate(project_ids, start=1):
-                self.assertEqual(registry.get_project(pid)["active_key"], f"key{idx}")
+                self.assertNotIn("active_key", registry.get_project(pid))
 
-            # Re-bind project-A to key10 and check project-B..E remain unaffected
-            registry.update_project_state("project-A", active_key="key10")
-            res_a = clients["project-A"].create_interaction(prompt="req A key10")
+            # Re-bind project-A to key10 via session and check project-B..E remain unaffected
+            sess_mgr.update_session(session_ids["project-A"], bound_key="key10")
+            res_a = clients["project-A"].create_interaction(prompt="req A key10", session_id=session_ids["project-A"])
             self.assertEqual(res_a["key_ref"], "key10")
 
-            res_b = clients["project-B"].create_interaction(prompt="req B stay key2")
+            res_b = clients["project-B"].create_interaction(prompt="req B stay key2", session_id=session_ids["project-B"])
             self.assertEqual(res_b["key_ref"], "key2")
 
     # -------------------------------------------------------------------------
@@ -151,18 +155,23 @@ class TestPhase6_5IntegrationAndConcurrency(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             pool = self._make_key_pool()
             registry = self._make_registry()
+            from sessions import SessionStateManager
+            sess_mgr = SessionStateManager(storage_path=os.path.join(self.test_dir.name, "sessions.json"))
 
             project_ids = [f"project-{p}" for p in ["A", "B", "C", "D", "E"]]
+            session_ids = {}
             for idx, pid in enumerate(project_ids, start=1):
                 pdir = os.path.join(self.test_dir.name, pid)
                 os.makedirs(pdir, exist_ok=True)
                 registry.register_project(pdir, project_id=pid)
-                registry.update_project_state(pid, active_key=f"key{idx}")
+                # Assign initial binding via session bound_key (Phase 7-2 contract)
+                sess = sess_mgr.create_session(pid, bound_key=f"key{idx}")
+                session_ids[pid] = sess["session_id"]
 
             def worker_task(task_id):
                 pid = project_ids[task_id % len(project_ids)]
-                client = AntigravityClient(key_pool=pool, project_id=pid, registry=registry)
-                res = client.create_interaction(prompt=f"conc task {task_id}")
+                client = AntigravityClient(key_pool=pool, project_id=pid, registry=registry, session_manager=sess_mgr)
+                res = client.create_interaction(prompt=f"conc task {task_id}", session_id=session_ids[pid])
                 return pid, res
 
             # Execute 20 total requests across 10 concurrent thread workers

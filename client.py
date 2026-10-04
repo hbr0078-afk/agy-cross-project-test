@@ -212,8 +212,16 @@ class AntigravityClient:
             attempts += 1
             try:
                 # 1. Selection Strategy: Prioritize same-tenant keys if we have a session_tenant
+                # Use session's bound_key for sticky key preference (Phase 7-9 fix)
                 prefer_candidate = None
-                if project_id and self.registry:
+                if session_id and self.session_manager:
+                    try:
+                        sess = self.session_manager.get_session(session_id)
+                        if sess and sess.get("bound_key") and sess["bound_key"] not in excluded_keys:
+                            prefer_candidate = sess["bound_key"]
+                    except Exception: pass
+
+                if not prefer_candidate and project_id and self.registry:
                     try:
                         p = self.registry.get_project(project_id)
                         if p and p.get("active_key") and p["active_key"] not in excluded_keys:

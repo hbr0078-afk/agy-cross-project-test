@@ -244,28 +244,31 @@ class ProjectRegistry:
     def update_project_state(
         self,
         project_id: str,
+        last_commit: Optional[str] = None,
+        state: Optional[str] = None,
+        # Runtime fields accepted for backward compatibility but NOT stored in projects.json
+        # They belong in sessions.json via SessionStateManager
         environment_id: Optional[str] = None,
         last_interaction_id: Optional[str] = None,
-        last_commit: Optional[str] = None,
         active_key: Optional[str] = None,
-        state: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        Update static project metadata only.
+        Runtime fields (active_key, environment_id, last_interaction_id) are accepted for
+        backward compatibility but are NOT stored in projects.json.
+        They belong in sessions.json via SessionStateManager.
+        """
         def _tx():
             data = self.load()
             if project_id not in data["projects"]:
                 raise KeyError(f"Project '{project_id}' not found in registry.")
 
             p = data["projects"][project_id]
-            if environment_id is not None:
-                p["environment_id"] = environment_id
-            if last_interaction_id is not None:
-                p["last_interaction_id"] = last_interaction_id
             if last_commit is not None:
                 p["last_commit"] = last_commit
-            if active_key is not None:
-                p["active_key"] = active_key
             if state is not None:
                 p["state"] = state
+            # Runtime fields deliberately ignored - not stored in projects.json
 
             data["projects"][project_id] = p
             self.save(data)

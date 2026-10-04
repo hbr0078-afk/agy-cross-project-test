@@ -8,12 +8,14 @@ import requests
 from client import AntigravityClient
 from keys import KeyPoolManager, AllKeysExhaustedError
 from registry import ProjectRegistry
+from sessions import SessionStateManager
 
 class TestSessionKeyBinding(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.storage_path = os.path.join(self.test_dir.name, "keys", "key_states.json")
         self.registry_path = os.path.join(self.test_dir.name, "registry", "registry.json")
+        self.session_path = os.path.join(self.test_dir.name, "sessions.json")
         self.proj_dir = tempfile.TemporaryDirectory()
 
     def tearDown(self):
@@ -25,6 +27,9 @@ class TestSessionKeyBinding(unittest.TestCase):
 
     def _make_registry(self):
         return ProjectRegistry(storage_path=self.registry_path)
+
+    def _make_session_manager(self):
+        return SessionStateManager(storage_path=self.session_path)
 
     # Test 1: prefer_key takes precedence when valid
     @patch("requests.post")
@@ -54,11 +59,14 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key2")
+            # Create a session with bound_key=key2 to test sticky key via session (Phase 7-2 contract)
+            sess = sess_mgr.create_session("proj-A", bound_key="key2")
+            session_id = sess["session_id"]
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="test proj affinity")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="test proj affinity", session_id=session_id)
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
@@ -74,20 +82,26 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key2")
+            # Create session with bound_key=key2 for sticky key via session (Phase 7-2 contract)
+            sess = sess_mgr.create_session("proj-A", bound_key="key2")
+            session_id = sess["session_id"]
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
             
-            res1 = client.create_interaction(prompt="req 1")
+            res1 = client.create_interaction(prompt="req 1", session_id=session_id)
             self.assertEqual(res1["key_ref"], "key2")
 
-            res2 = client.create_interaction(prompt="req 2")
+            res2 = client.create_interaction(prompt="req 2", session_id=session_id)
             self.assertEqual(res2["key_ref"], "key2")
 
-            # Registry active_key remains key2
+            # Projects.json should NOT have active_key (Phase 7-2 contract)
             p = reg.get_project("proj-A")
-            self.assertEqual(p["active_key"], "key2")
+            self.assertNotIn("active_key", p)
+            # Session should have bound_key
+            sess = sess_mgr.get_session(session_id)
+            self.assertEqual(sess["bound_key"], "key2")
 
     # Test 4: Project isolation (different projects do not interfere with each other's key bindings)
     @patch("requests.post")
@@ -103,18 +117,21 @@ class TestSessionKeyBinding(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 mgr = self._make_manager()
                 reg = self._make_registry()
+                sess_mgr = self._make_session_manager()
                 reg.register_project(self.proj_dir.name, project_id="proj-A")
                 reg.register_project(proj_dir_b.name, project_id="proj-B")
-                reg.update_project_state("proj-A", active_key="key1")
-                reg.update_project_state("proj-B", active_key="key2")
+                sess_a = sess_mgr.create_session("proj-A", bound_key="key1")
+                sess_b = sess_mgr.create_session("proj-B", bound_key="key2")
+                session_id_a = sess_a["session_id"]
+                session_id_b = sess_b["session_id"]
 
-                client_a = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-                client_b = AntigravityClient(key_pool=mgr, project_id="proj-B", registry=reg)
+                client_a = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+                client_b = AntigravityClient(key_pool=mgr, project_id="proj-B", registry=reg, session_manager=sess_mgr)
 
-                res_a = client_a.create_interaction(prompt="proj A prompt")
+                res_a = client_a.create_interaction(prompt="proj A prompt", session_id=session_id_a)
                 self.assertEqual(res_a["key_ref"], "key1")
 
-                res_b = client_b.create_interaction(prompt="proj B prompt")
+                res_b = client_b.create_interaction(prompt="proj B prompt", session_id=session_id_b)
                 self.assertEqual(res_b["key_ref"], "key2")
         finally:
             proj_dir_b.cleanup()
@@ -136,11 +153,12 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess_mgr.create_session("proj-A", bound_key="key1")
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="trigger 429 rollover")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="trigger 429 rollover", session_id="sess_proj-A_1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
@@ -161,17 +179,21 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess_mgr.create_session("proj-A", bound_key="key1")
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="rollover update registry")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="rollover update registry", session_id="sess_proj-A_1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
-            # Check registry active_key is NOT updated in ProjectRegistry on rollover (remains key1)
+            # Projects.json should NOT have active_key (Phase 7-2 contract)
             p = reg.get_project("proj-A")
-            self.assertEqual(p["active_key"], "key1")
+            self.assertNotIn("active_key", p)
+            # Session bound_key should be updated
+            sess = sess_mgr.get_session("sess_proj-A_1")
+            self.assertEqual(sess["bound_key"], "key2")
 
     # Test 7: 401 triggers INACTIVE state and rollover to next key
     @patch("requests.post")
@@ -190,17 +212,21 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess_mgr.create_session("proj-A", bound_key="key1")
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="test 401 rollover")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="test 401 rollover", session_id="sess_proj-A_1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
-            # Check registry active_key is NOT updated in ProjectRegistry on rollover (remains key1)
+            # Projects.json should NOT have active_key (Phase 7-2 contract)
             p = reg.get_project("proj-A")
-            self.assertEqual(p["active_key"], "key1")
+            self.assertNotIn("active_key", p)
+            # Session bound_key should be updated
+            sess = sess_mgr.get_session("sess_proj-A_1")
+            self.assertEqual(sess["bound_key"], "key2")
 
     # Test 8: Sticky key in COOLDOWN is not forced; skips to next available key
     @patch("requests.post")
@@ -214,16 +240,17 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess_mgr.create_session("proj-A", bound_key="key1")
 
             # Put key1 into COOLDOWN
             mgr.report_result("key1", status_code=429)
             status = mgr.get_status()
             self.assertEqual(status["key1"]["state"], "COOLDOWN")
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="cooldown skip prompt")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="cooldown skip prompt", session_id="sess_proj-A_1")
             self.assertTrue(res["success"])
             # Should skip key1 and use key2
             self.assertEqual(res["key_ref"], "key2")
@@ -240,16 +267,17 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess_mgr.create_session("proj-A", bound_key="key1")
 
             # Put key1 into INACTIVE
             mgr.report_result("key1", status_code=401)
             status = mgr.get_status()
             self.assertEqual(status["key1"]["state"], "INACTIVE")
 
-            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg)
-            res = client.create_interaction(prompt="inactive skip prompt")
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            res = client.create_interaction(prompt="inactive skip prompt", session_id="sess_proj-A_1")
             self.assertTrue(res["success"])
             self.assertEqual(res["key_ref"], "key2")
 
@@ -276,13 +304,22 @@ class TestSessionKeyBinding(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             mgr = self._make_manager()
             reg = self._make_registry()
+            sess_mgr = self._make_session_manager()
             reg.register_project(self.proj_dir.name, project_id="proj-A")
-            reg.update_project_state("proj-A", active_key="key1")
+            sess = sess_mgr.create_session("proj-A", bound_key="key1")
+            session_id = sess["session_id"]
 
-            # Simulate multiple rapid acquires with project_id
-            for _ in range(10):
-                ref, idx = mgr.acquire_key(project_id="proj-A", registry=reg)
-                self.assertEqual(ref, "key1")
+            # Simulate multiple rapid acquires with session_id (via client)
+            from client import AntigravityClient
+            client = AntigravityClient(key_pool=mgr, project_id="proj-A", registry=reg, session_manager=sess_mgr)
+            with patch("requests.post") as mock_post:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.json.return_value = {"id": "int_1", "output": "ok"}
+                mock_post.return_value = mock_resp
+                for _ in range(10):
+                    res = client.create_interaction(prompt="test", session_id=session_id)
+                    self.assertEqual(res["key_ref"], "key1")
 
     # Test 12: Concurrent requests for different projects do not mix bindings
     def test_concurrent_different_projects_binding(self):
@@ -292,10 +329,11 @@ class TestSessionKeyBinding(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 mgr = self._make_manager()
                 reg = self._make_registry()
+                sess_mgr = self._make_session_manager()
                 reg.register_project(self.proj_dir.name, project_id="proj-A")
                 reg.register_project(proj_b.name, project_id="proj-B")
-                reg.update_project_state("proj-A", active_key="key1")
-                reg.update_project_state("proj-B", active_key="key2")
+                sess_mgr.create_session("proj-A", bound_key="key1")
+                sess_mgr.create_session("proj-B", bound_key="key2")
 
                 ref_a, _ = mgr.acquire_key(project_id="proj-A", registry=reg)
                 ref_b, _ = mgr.acquire_key(project_id="proj-B", registry=reg)
@@ -308,13 +346,16 @@ class TestSessionKeyBinding(unittest.TestCase):
     def test_registry_persistence_across_restart(self):
         reg1 = self._make_registry()
         reg1.register_project(self.proj_dir.name, project_id="proj-A")
-        reg1.update_project_state("proj-A", active_key="key2")
+        reg1.update_project_state("proj-A", last_commit="commit-123", state="ACTIVE")
 
         # New registry instance pointing to same file
         reg2 = self._make_registry()
         p = reg2.get_project("proj-A")
         self.assertIsNotNone(p)
-        self.assertEqual(p["active_key"], "key2")
+        # Projects.json should NOT have active_key (Phase 7-2 contract)
+        self.assertNotIn("active_key", p)
+        self.assertEqual(p["last_commit"], "commit-123")
+        self.assertEqual(p["state"], "ACTIVE")
 
     # Test 14: KeyPool state reload maintains COOLDOWN/INACTIVE states
     def test_key_pool_state_persistence(self):

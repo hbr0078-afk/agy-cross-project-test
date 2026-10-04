@@ -444,11 +444,25 @@ class KeyPoolManager:
         return self._with_lock(_tx)
 
     def get_status(self) -> Dict[str, Any]:
-        """Returns status map of all discovered keys."""
+        """Returns status map of all discovered keys. Read-only - does not modify storage."""
         def _tx():
             data = self._load_raw()
-            self._sync_discovered_keys_locked(data)
-            self._save_raw(data)
-            return data.get("keys", {})
+            # Sync discovered keys without saving (read-only)
+            discovered = self.discover_keys()
+            keys_dict = data.get("keys", {})
+            for idx in discovered:
+                ref = f"key{idx}"
+                if ref not in keys_dict:
+                    keys_dict[ref] = {
+                        "index": idx,
+                        "state": "ACTIVE",
+                        "fail_count": 0,
+                        "last_status_code": None,
+                        "cooldown_until": None,
+                        "last_used_at": 0,
+                        "last_success_at": 0,
+                        "tenant_id": ""
+                    }
+            return keys_dict
 
         return self._with_lock(_tx)
