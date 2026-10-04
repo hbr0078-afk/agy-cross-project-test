@@ -162,6 +162,8 @@ class TestWorkspaceSync(unittest.TestCase):
 
     def test_10_real_antigravity_e2e_sync(self):
         # Test 10: Real Antigravity remote environment sync E2E test
+        if not os.environ.get("ENABLE_LIVE_E2E"):
+            self.skipTest("Live E2E isolated: set ENABLE_LIVE_E2E=1 to run")
         key = get_api_key_by_index(1)
         if not key:
             self.skipTest("No API key available for real E2E test")
