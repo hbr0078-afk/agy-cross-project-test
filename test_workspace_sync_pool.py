@@ -12,6 +12,16 @@ class TestWorkspaceSyncPool(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.state_file = os.path.join(self.test_dir, "key_states.json")
         self.pool = KeyPoolManager(storage_path=self.state_file, cooldown_seconds=60)
+
+        # Fixture isolation: KeyPoolManager.discover_keys() normally scans the host
+        # environment and falls back to ~/.bashrc, whose AGY_KEY_1..N exports would be
+        # injected into this per-test temp store and break determinism (e.g. the
+        # concurrency test expecting exactly 3 keys). Bind discovery to the isolated
+        # store so the test-only key_states.json is the single source of truth.
+        self._discover_patcher = patch.object(
+            KeyPoolManager, "discover_keys", self._discover_from_store
+        )
+        self._discover_patcher.start()
         self.manifest = SourceManifest(
             source_type="local",
             source_path=self.test_dir,
@@ -28,7 +38,18 @@ class TestWorkspaceSyncPool(unittest.TestCase):
         )
 
     def tearDown(self):
+        self._discover_patcher.stop()
         shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @staticmethod
+    def _discover_from_store(pool):
+        """Test-only discover_keys(): list indices present in the isolated store."""
+        data = pool._load_raw()
+        indices = []
+        for ref in data.get("keys", {}):
+            if ref.startswith("key") and ref[3:].isdigit():
+                indices.append(int(ref[3:]))
+        return sorted(indices)
 
     def _setup_mock_keys(self, count=2):
         keys_dict = {}
