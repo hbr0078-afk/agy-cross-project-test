@@ -22,6 +22,9 @@ class RouterConfig:
     log_level: str = "INFO"
     git_auto_checkpoint: bool = True
     default_session_timeout: int = 3600  # 1 hour in seconds
+    # Phase 8-2: request-level round-robin across distinct projects/tenants.
+    # Default OFF so the legacy environment_id-based routing is unchanged.
+    request_round_robin: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -72,6 +75,7 @@ def load_config(
         'AGY_LOG_LEVEL': ('log_level', str),
         'AGY_GIT_AUTO_CHECKPOINT': ('git_auto_checkpoint', lambda x: x.lower() in ('true', '1', 'yes')),
         'AGY_DEFAULT_SESSION_TIMEOUT': ('default_session_timeout', int),
+        'AGY_REQUEST_ROUND_ROBIN': ('request_round_robin', lambda x: x.lower() in ('true', '1', 'yes')),
     }
 
     for env_var, (attr, converter) in env_overrides.items():

@@ -452,6 +452,7 @@ class KeyPoolManager:
             keys_dict = data.get("keys", {})
             for idx in discovered:
                 ref = f"key{idx}"
+                tenant_id = os.environ.get(f"AGY_TENANT_{idx}") or os.environ.get(f"GEMINI_TENANT_{idx}") or ""
                 if ref not in keys_dict:
                     keys_dict[ref] = {
                         "index": idx,
@@ -461,8 +462,11 @@ class KeyPoolManager:
                         "cooldown_until": None,
                         "last_used_at": 0,
                         "last_success_at": 0,
-                        "tenant_id": ""
+                        "tenant_id": tenant_id
                     }
+                elif tenant_id and keys_dict[ref].get("tenant_id") != tenant_id:
+                    # Reflect env tenant in the returned view (never persisted here).
+                    keys_dict[ref]["tenant_id"] = tenant_id
             return keys_dict
 
         return self._with_lock(_tx)

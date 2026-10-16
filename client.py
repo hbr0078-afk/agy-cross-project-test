@@ -16,6 +16,7 @@ class AntigravityClient:
         project_id: Optional[str] = None,
         registry: Optional[Any] = None,
         session_manager: Optional[Any] = None,
+        round_robin: Optional[Any] = None,
     ):
         if not api_key and key_pool is None:
             raise ValueError("Either api_key or key_pool must be provided.")
@@ -24,6 +25,13 @@ class AntigravityClient:
         self.project_id = project_id
         self.registry = registry
         self.session_manager = session_manager
+        # Phase 8-2: when a RoundRobinSelector is supplied, every top-level call
+        # (create_interaction) advances the project rotation. Off by default.
+        self.round_robin = round_robin
+
+    @property
+    def is_round_robin(self) -> bool:
+        return self.round_robin is not None
 
     @property
     def is_pool_mode(self) -> bool:
@@ -47,6 +55,15 @@ class AntigravityClient:
         Supports session_id isolation via SessionStateManager.
         """
         target_project_id = project_id or self.project_id
+
+        # Phase 8-2: request-level round-robin. A top-level call cycles to the next
+        # distinct project; retries inside the call stay on the retry policy. Session
+        # bindings and remote environment/interaction ids deliberately do NOT apply.
+        if self.round_robin is not None:
+            if not self.is_pool_mode:
+                raise ValueError("request_round_robin requires key pool mode.")
+            return self._create_interaction_round_robin(
+                prompt=prompt, environment=environment, timeout=timeout)
 
         # Resolve session state if session_id or session_manager provided
         resolved_env_id = environment_id
@@ -104,6 +121,31 @@ class AntigravityClient:
             session_id=target_session.get("session_id") if target_session else session_id,
             session_tenant=session_tenant
         )
+
+    def _create_interaction_round_robin(
+        self, prompt: str, environment: str, timeout: int
+    ) -> Dict[str, Any]:
+        """Select the next project, then make one independent request there."""
+        project = self.round_robin.next_project()
+        result = self._create_interaction_with_pool(
+            prompt=prompt,
+            environment=environment,
+            environment_id=None,
+            previous_interaction_id=None,
+            timeout=timeout,
+            project_id=project["project_id"],
+            session_id=None,
+            session_tenant="",
+            rr_project=project,
+        )
+        if result.get("success"):
+            self.round_robin.record_usage(
+                project["project_id"],
+                usage=result.get("usage"),
+                prompt_chars=len(prompt),
+                output_chars=len(result.get("output") or ""),
+            )
+        return result
 
     def _execute_request(
         self,
@@ -185,6 +227,7 @@ class AntigravityClient:
         project_id: Optional[str] = None,
         session_id: Optional[str] = None,
         session_tenant: str = "",
+        rr_project: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Manages key-pool lifecycle:
@@ -214,21 +257,28 @@ class AntigravityClient:
                 # 1. Selection Strategy: Prioritize same-tenant keys if we have a session_tenant
                 # Use session's bound_key for sticky key preference (Phase 7-9 fix)
                 prefer_candidate = None
-                if session_id and self.session_manager:
+                # Round-robin: pin to the selected project's keys and never let a
+                # session bound_key (or project active_key) override the rotation.
+                if rr_project:
+                    for ref in rr_project.get("key_refs", []):
+                        if ref not in excluded_keys:
+                            prefer_candidate = ref
+                            break
+                if not prefer_candidate and session_id and self.session_manager:
                     try:
                         sess = self.session_manager.get_session(session_id)
                         if sess and sess.get("bound_key") and sess["bound_key"] not in excluded_keys:
                             prefer_candidate = sess["bound_key"]
                     except Exception: pass
 
-                if not prefer_candidate and project_id and self.registry:
+                if not prefer_candidate and not rr_project and project_id and self.registry:
                     try:
                         p = self.registry.get_project(project_id)
                         if p and p.get("active_key") and p["active_key"] not in excluded_keys:
                             prefer_candidate = p["active_key"]
                     except Exception: pass
 
-                if not prefer_candidate:
+                if not prefer_candidate and not rr_project:
                     status_data = self._key_pool.get_status()
                     active_candidates = [k for k, v in status_data.items() if v.get("state") == "ACTIVE" and k not in excluded_keys]
                     
@@ -240,11 +290,12 @@ class AntigravityClient:
                     if not prefer_candidate and active_candidates:
                         prefer_candidate = active_candidates[0]
 
+                rr_tenant = (rr_project.get("tenant_id") if rr_project else None) or current_tenant
                 key_ref, key_idx = self._key_pool.acquire_key(
                     prefer_key=prefer_candidate,
                     project_id=project_id,
                     registry=self.registry,
-                    tenant_id=current_tenant,
+                    tenant_id=rr_tenant,
                     exclude_keys=excluded_keys
                 )
             except AllKeysExhaustedError:
@@ -311,7 +362,8 @@ class AntigravityClient:
                     except Exception: pass
 
                 # If environment changed (e.g. fresh environment provisioned due to fallback)
-                if new_env_id and new_env_id != environment_id and project_id and self.registry:
+                if (not rr_project and new_env_id and new_env_id != environment_id
+                        and project_id and self.registry):
                     log_recovery_workspace_sync(session_id or "", project_id or "", new_env_id, "environment_changed")
                     self._sync_project_to_environment(new_env_id, project_id, session_id)
 

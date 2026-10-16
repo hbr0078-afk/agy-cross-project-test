@@ -341,6 +341,7 @@ def cmd_config_show(args):
     print(f"Log Level:               {config.log_level}")
     print(f"Git Auto Checkpoint:     {config.git_auto_checkpoint}")
     print(f"Default Session Timeout: {config.default_session_timeout}")
+    print(f"Request Round Robin:     {config.request_round_robin}")
     print("============================")
 
 
@@ -371,7 +372,7 @@ def cmd_config_set(args):
                 sys.exit(1)
         else:
             print(f"[!] Unknown config key: {args.key}", file=sys.stderr)
-            print("Available keys: default_key_index, cooldown_seconds, max_total_sync_bytes, max_file_size_bytes, log_level, git_auto_checkpoint, default_session_timeout")
+            print("Available keys: default_key_index, cooldown_seconds, max_total_sync_bytes, max_file_size_bytes, log_level, git_auto_checkpoint, default_session_timeout, request_round_robin")
             sys.exit(1)
     except ValueError as e:
         print(f"[!] Invalid value: {e}", file=sys.stderr)
