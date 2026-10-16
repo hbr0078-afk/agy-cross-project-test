@@ -18,6 +18,12 @@ from observability import log_event
 
 DEFAULT_RR_STATE_PATH = os.path.join(os.path.expanduser("~/.agy-router"), "rr_state.json")
 
+# Keys with no project identity are grouped into a SINGLE slot. Several keys from
+# the same (unknown) project must never inflate the number of quota units; the
+# cost of guessing wrong is only that we under-use keys until real tenant metadata
+# (AGY_TENANT_<n>) is supplied, never that we over-count a project's quota.
+UNKNOWN_PROJECT_ID = "__unknown__"
+
 
 class RoundRobinSelector:
     """Advances a persisted project pointer once per top-level request."""
@@ -63,13 +69,18 @@ class RoundRobinSelector:
 
     # ---- project view ----------------------------------------------------
     def eligible_projects(self) -> List[Dict[str, Any]]:
-        """Distinct projects with >=1 usable key, in deterministic order."""
+        """Distinct projects with >=1 usable key, in deterministic order.
+
+        Keys sharing a tenant_id are one quota unit. Keys with no tenant_id are
+        collapsed into the single ``UNKNOWN_PROJECT_ID`` slot rather than being
+        counted as if each key were its own project.
+        """
         status = self.key_pool.get_status()
         groups: Dict[str, Dict[str, Any]] = {}
         for ref in sorted(status, key=lambda r: status[r].get("index", 0)):
             entry = status[ref]
             tenant = entry.get("tenant_id") or ""
-            project_id = tenant or ref
+            project_id = tenant if tenant else UNKNOWN_PROJECT_ID
             groups.setdefault(project_id, {"project_id": project_id, "tenant_id": tenant,
                                            "key_refs": []})
             groups[project_id]["key_refs"].append(ref)

@@ -50,6 +50,52 @@ def cmd_test_agent(args):
     print("====================")
 
 
+def cmd_run_request(args):
+    """Phase 8-2.1: run one local-workspace coding request through the wired runtime.
+
+    This is the production consumer of the Phase 8-2 stack: config -> selector ->
+    client -> runner/workspace are assembled in runtime.py, never per-request here.
+    """
+    from runtime import run_coding_request, RuntimeWiringError
+
+    try:
+        config = load_config(args.config_path)
+    except ConfigCorruptedError as e:
+        print(f"[!] Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not getattr(config, "request_round_robin", False):
+        print("[!] request_round_robin is disabled. Enable it with "
+              "'agy-router config set request_round_robin true' or AGY_REQUEST_ROUND_ROBIN=1.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    workspace = args.workspace or os.getcwd()
+    try:
+        outcome = run_coding_request(
+            config, workspace, args.prompt,
+            required_files=args.file or None,
+            task_context=args.task_context,
+            timeout=args.timeout,
+        )
+    except RuntimeWiringError as e:
+        print(f"[!] {e}", file=sys.stderr)
+        sys.exit(2)
+
+    result = outcome.get("result", {})
+    if not result.get("success"):
+        print(f"[!] Request failed: HTTP {result.get('status_code')}", file=sys.stderr)
+        print(f"[!] Error Details: {result.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+    applied = outcome.get("applied") or []
+    print("[+] Round-robin coding request complete.")
+    print(f"    - Workspace:     {workspace}")
+    print(f"    - Applied files: {', '.join(applied) if applied else '(none)'}")
+    if outcome.get("validation_error"):
+        print(f"    - Validation:    rejected model output ({outcome['validation_error']})")
+
+
 def cmd_project_register(args):
     registry = ProjectRegistry()
     try:
@@ -710,6 +756,20 @@ def main():
     diag_parser = subparsers.add_parser("diagnostics", help="Show runtime diagnostics overview")
     diag_parser.add_argument("--json", action="store_true", help="Output as JSON")
     diag_parser.set_defaults(func=cmd_diagnostics)
+
+    # run (Phase 8-2.1 request-level round-robin local workspace flow)
+    run_parser = subparsers.add_parser(
+        "run", help="Run one round-robin local-workspace coding request")
+    run_parser.add_argument("prompt", type=str, help="Task prompt")
+    run_parser.add_argument("--workspace", type=str, default=None,
+                            help="Local workspace root (default: current directory)")
+    run_parser.add_argument("--file", action="append", default=None,
+                            help="Required file to include as context (repeatable)")
+    run_parser.add_argument("--task-context", type=str, default=None,
+                            help="Additional task context")
+    run_parser.add_argument("--timeout", type=int, default=120,
+                            help="Request timeout in seconds (default: 120)")
+    run_parser.set_defaults(func=cmd_run_request)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):
