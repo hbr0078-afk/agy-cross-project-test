@@ -1,0 +1,24 @@
+{
+  "name": "@myorg/openclaw-antigravity-test-provider",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Test OpenClaw Model Provider for Antigravity (single API key, test-only)",
+  "peerDependencies": {
+    "openclaw": ">=2026.10.0"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "providers": ["antigravity-test"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.10.4",
+      "pluginSdkVersion": ">=2026.3.24-beta.2"
+    }
+  },
+  "scripts": {
+    "test": "node --experimental-test-loader tests/*.test.mjs"
+  }
+}

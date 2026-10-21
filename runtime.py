@@ -36,11 +36,13 @@ def build_client(
         cooldown_seconds=getattr(config, "cooldown_seconds", 60)
     )
     selector = selector_from_config(config, pool, storage_path=rr_storage_path)
+    model = getattr(config, "model", None)
     client = AntigravityClient(
         key_pool=pool,
         registry=registry,
         session_manager=session_manager,
         round_robin=selector,
+        model=model,
     )
     return client, pool, selector
 

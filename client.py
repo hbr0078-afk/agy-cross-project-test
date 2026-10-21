@@ -17,6 +17,7 @@ class AntigravityClient:
         registry: Optional[Any] = None,
         session_manager: Optional[Any] = None,
         round_robin: Optional[Any] = None,
+        model: Optional[str] = None,
     ):
         if not api_key and key_pool is None:
             raise ValueError("Either api_key or key_pool must be provided.")
@@ -28,6 +29,7 @@ class AntigravityClient:
         # Phase 8-2: when a RoundRobinSelector is supplied, every top-level call
         # (create_interaction) advances the project rotation. Off by default.
         self.round_robin = round_robin
+        self.model = model
 
     @property
     def is_round_robin(self) -> bool:
@@ -165,6 +167,11 @@ class AntigravityClient:
             "input": prompt,
             "environment": environment,
         }
+        if self.model:
+            payload["agent_config"] = {
+                "type": "antigravity",
+                "model": self.model,
+            }
         if environment_id:
             payload["environment_id"] = environment_id
         if previous_interaction_id:

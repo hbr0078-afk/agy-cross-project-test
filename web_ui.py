@@ -144,6 +144,10 @@ def normalize_keys(data):
             or item.get("updated_at")
             or "never"
         )
+        if isinstance(last_used, (int, float)) and last_used > 0:
+            last_used = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_used))
+
+        tenant_id = item.get("tenant_id") or item.get("tenantId") or ""
 
         normalized.append({
             "key_ref": str(ref),
@@ -151,8 +155,10 @@ def normalize_keys(data):
             "state": state,
             "fail_count": fail_count,
             "last_used": str(last_used),
+            "tenant_id": str(tenant_id),
         })
 
+    normalized.sort(key=lambda x: x["index"] if isinstance(x["index"], int) else 9999)
     return normalized
 
 
@@ -291,6 +297,213 @@ def get_health_data():
             "error": res["stderr"],
             "returncode": res["returncode"],
         }
+
+
+def _discover_bashrc_indices(bashrc_path):
+    indices = set()
+    if not os.path.exists(bashrc_path):
+        return indices
+    pat = re.compile(r"^export\s+(?:AGY_KEY_|GEMINI_API_KEY_)(\d+)=")
+    with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("export GEMINI_API_KEY="):
+                indices.add(1)
+            m = pat.match(s)
+            if m:
+                indices.add(int(m.group(1)))
+    return indices
+
+
+def add_key_to_pool(api_key, index=None, tenant_id=""):
+    """Add or update an AGY_KEY_<index> in ~/.bashrc, key_states.json, and restart adapter."""
+    api_key = (api_key or "").strip()
+    tenant_id = (tenant_id or "").strip()
+    if not api_key or not re.match(r"^[A-Za-z0-9_\-]+$", api_key):
+        return {"success": False, "error": "유효한 API Key 형식이 아닙니다."}
+
+    bashrc_path = os.path.expanduser("~/.bashrc")
+    existing_indices = _discover_bashrc_indices(bashrc_path)
+
+    if index is not None and str(index).strip() != "":
+        try:
+            idx = int(index)
+            if idx < 1 or idx > 999:
+                return {"success": False, "error": "Index는 1~999 사이여야 합니다."}
+        except ValueError:
+            return {"success": False, "error": "Index는 숫자여야 합니다."}
+    else:
+        idx = 1
+        while idx in existing_indices:
+            idx += 1
+
+    lines = []
+    if os.path.exists(bashrc_path):
+        with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+    target_prefix = f"export AGY_KEY_{idx}="
+    new_line = f'export AGY_KEY_{idx}="{api_key}"\n'
+    replaced = False
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith(target_prefix):
+            if not replaced:
+                new_lines.append(new_line)
+                replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        new_lines.append(new_line)
+
+    tmp_bashrc = bashrc_path + ".tmp-webui"
+    with open(tmp_bashrc, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+    os.chmod(tmp_bashrc, 0o600)
+
+    chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
+    if chk.returncode != 0:
+        os.remove(tmp_bashrc)
+        return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
+
+    os.replace(tmp_bashrc, bashrc_path)
+    os.chmod(bashrc_path, 0o600)
+
+    # Update tenants.env if tenant_id provided
+    if tenant_id:
+        tenants_path = os.path.expanduser("~/.agy-router/tenants.env")
+        t_lines = []
+        if os.path.exists(tenants_path):
+            with open(tenants_path, "r", encoding="utf-8", errors="ignore") as f:
+                t_lines = f.readlines()
+        t_prefix = f"AGY_TENANT_{idx}="
+        t_replaced = False
+        new_t_lines = []
+        for tl in t_lines:
+            if tl.strip().startswith(t_prefix) or tl.strip().startswith(f"export {t_prefix}"):
+                if not t_replaced:
+                    new_t_lines.append(f"AGY_TENANT_{idx}={tenant_id}\n")
+                    t_replaced = True
+            else:
+                new_t_lines.append(tl)
+        if not t_replaced:
+            if new_t_lines and not new_t_lines[-1].endswith("\n"):
+                new_t_lines[-1] += "\n"
+            new_t_lines.append(f"AGY_TENANT_{idx}={tenant_id}\n")
+        with open(tenants_path, "w", encoding="utf-8") as f:
+            f.writelines(new_t_lines)
+        os.chmod(tenants_path, 0o600)
+
+    # Update key_states.json immediately
+    state_path = os.path.expanduser("~/.agy-router/key_states.json")
+    os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
+    state_data = {"keys": {}}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+        except Exception:
+            state_data = {"keys": {}}
+    if "keys" not in state_data or not isinstance(state_data["keys"], dict):
+        state_data["keys"] = {}
+
+    key_ref = f"key{idx}"
+    entry = state_data["keys"].get(key_ref, {})
+    entry["index"] = idx
+    entry["state"] = "ACTIVE"
+    entry["fail_count"] = 0
+    entry["cooldown_until"] = None
+    entry.setdefault("last_used_at", None)
+    entry.setdefault("last_success_at", None)
+    if tenant_id:
+        entry["tenant_id"] = tenant_id
+    state_data["keys"][key_ref] = entry
+
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state_data, f, indent=2, ensure_ascii=False)
+    os.chmod(state_path, 0o600)
+
+    disc = run_cli("key-pool", "discover")
+    subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+
+    return {
+        "success": True,
+        "key_ref": key_ref,
+        "index": idx,
+        "output": f"Added {key_ref} (index={idx}) to ~/.bashrc & key_states.json, restarted agy-adapter.service.\n{disc.get('stdout', '')}".strip(),
+    }
+
+
+def delete_key_from_pool(key_ref=None, index=None):
+    """Remove a key from ~/.bashrc, key_states.json, tenants.env, and restart adapter."""
+    idx = None
+    if index is not None and str(index).strip() != "":
+        try:
+            idx = int(index)
+        except ValueError:
+            pass
+    if idx is None and key_ref:
+        m = re.match(r"^key[-_]?(\d+)$", str(key_ref).strip(), re.IGNORECASE)
+        if m:
+            idx = int(m.group(1))
+    if idx is None:
+        return {"success": False, "error": "삭제할 키의 유효한 index 또는 key_ref가 필요합니다."}
+
+    key_ref_norm = f"key{idx}"
+    bashrc_path = os.path.expanduser("~/.bashrc")
+    removed_lines = 0
+    if os.path.exists(bashrc_path):
+        with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith(f"export AGY_KEY_{idx}=") or s.startswith(f"export GEMINI_API_KEY_{idx}="):
+                removed_lines += 1
+                continue
+            if idx == 1 and s.startswith("export GEMINI_API_KEY="):
+                removed_lines += 1
+                continue
+            new_lines.append(line)
+        tmp_bashrc = bashrc_path + ".tmp-webui"
+        with open(tmp_bashrc, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        os.chmod(tmp_bashrc, 0o600)
+        chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
+        if chk.returncode != 0:
+            os.remove(tmp_bashrc)
+            return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
+        os.replace(tmp_bashrc, bashrc_path)
+        os.chmod(bashrc_path, 0o600)
+
+    # Remove from key_states.json
+    state_path = os.path.expanduser("~/.agy-router/key_states.json")
+    removed_state = False
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            if isinstance(state_data, dict) and isinstance(state_data.get("keys"), dict):
+                if key_ref_norm in state_data["keys"]:
+                    del state_data["keys"][key_ref_norm]
+                    removed_state = True
+                if key_ref and key_ref in state_data["keys"]:
+                    del state_data["keys"][key_ref]
+                    removed_state = True
+                with open(state_path, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+    return {
+        "success": True,
+        "key_ref": key_ref_norm,
+        "index": idx,
+        "output": f"Deleted {key_ref_norm} (removed {removed_lines} line(s) from ~/.bashrc, state_removed={removed_state}) and restarted agy-adapter.service.",
+    }
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -680,6 +893,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="controls" style="flex-wrap: wrap;">
+      <div class="btn-group" style="align-items: center; gap: 0.75rem;">
+        <label style="color: var(--slate); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;">Antigravity Model</label>
+        <select id="modelSelect" style="background: #0f172a; color: #f8fafc; border: 1px solid var(--card-border); border-radius: 8px; padding: 0.55rem 0.8rem; font-family: var(--font-mono); font-size: 0.85rem; min-width: 220px;">
+          <option value="">Loading...</option>
+        </select>
+        <button class="btn-primary" id="btnApplyModel" onclick="handleApplyModel()">Apply Model</button>
+      </div>
+      <div class="btn-group" style="align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+        <label style="color: var(--slate); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 0.25rem;">Add Key</label>
+        <input type="number" id="newKeyIndex" class="search-input" style="min-width: 90px; width: 90px;" placeholder="Idx (Auto)" min="1" max="999">
+        <input type="password" id="newKeyValue" class="search-input" style="min-width: 240px;" placeholder="API Key (AIzaSy...)">
+        <input type="text" id="newKeyTenant" class="search-input" style="min-width: 190px;" placeholder="Tenant/Project ID (Optional)">
+        <button class="btn-success" id="btnAddKey" onclick="handleAddKey()">
+          + Add / Update Key
+        </button>
+      </div>
+    </div>
+
     <div class="controls">
       <div class="btn-group">
         <button class="btn-primary" id="btnDiscover" onclick="handleDiscover()">
@@ -715,14 +947,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <tr>
             <th style="width: 80px;">Index</th>
             <th>Key Ref</th>
+            <th>Tenant / Project</th>
             <th style="width: 140px;">State</th>
             <th style="width: 120px;">Fail Count</th>
             <th>Last Used</th>
+            <th style="width: 110px; text-align: right;">Action</th>
           </tr>
         </thead>
         <tbody id="keysTableBody">
           <tr>
-            <td colspan="5" class="empty-state">Loading key pool...</td>
+            <td colspan="7" class="empty-state">Loading key pool...</td>
           </tr>
         </tbody>
       </table>
@@ -820,7 +1054,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
 
       if (filtered.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No matching keys found in pool.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="empty-state">No matching keys found in pool.</td></tr>`;
         return;
       }
 
@@ -832,14 +1066,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         else if (stateLower.includes('fail') || stateLower.includes('exhaust')) badgeClass = 'badge-error';
 
         const failClass = Number(k.fail_count) > 0 ? 'fail-positive' : 'fail-zero';
+        const safeRef = escapeHtml(k.key_ref || '-');
+        const safeIdx = k.index ?? '';
 
         return `
           <tr>
             <td class="mono" style="color: var(--slate);">${k.index ?? '-'}</td>
-            <td class="mono" style="font-weight: 600; color: #f1f5f9;">${escapeHtml(k.key_ref || '-')}</td>
+            <td class="mono" style="font-weight: 600; color: #f1f5f9;">${safeRef}</td>
+            <td class="mono" style="color: var(--slate);">${escapeHtml(k.tenant_id || '-')}</td>
             <td><span class="badge ${badgeClass}">${escapeHtml(k.state || 'UNKNOWN')}</span></td>
             <td class="mono ${failClass}">${k.fail_count ?? 0}</td>
             <td class="mono" style="color: var(--slate);">${escapeHtml(k.last_used || 'never')}</td>
+            <td style="text-align: right;">
+              <button class="btn-outline" style="padding: 0.3rem 0.65rem; font-size: 0.75rem; color: #f87171; border-color: rgba(239,68,68,0.35);" onclick="handleDeleteKey('${safeRef}', '${safeIdx}')">Delete</button>
+            </td>
           </tr>
         `;
       }).join('');
@@ -911,6 +1151,122 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function fetchConfig() {
+      try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        const sel = document.getElementById('modelSelect');
+        const models = data.available_models || [];
+        const current = data.model || '';
+        sel.innerHTML = models.map(m =>
+          `<option value="${escapeHtml(m)}" ${m === current ? 'selected' : ''}>${escapeHtml(m)}</option>`
+        ).join('');
+        if (current && !models.includes(current)) {
+          sel.innerHTML = `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)}</option>` + sel.innerHTML;
+        }
+      } catch (err) {
+        console.error('Failed to fetch config:', err);
+        showToast(`Config load error: ${err.message}`, 'error');
+      }
+    }
+
+    async function handleApplyModel() {
+      const btn = document.getElementById('btnApplyModel');
+      const model = document.getElementById('modelSelect').value;
+      if (!model) {
+        showToast('Select a model first', 'error');
+        return;
+      }
+      btn.disabled = true;
+      setTerminal('Applying model', model);
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          setTerminal('Model Applied', `Active Antigravity model is now: ${model}`);
+          showToast(`Model switched to ${model}`, 'success');
+        } else {
+          setTerminal('Model Apply Failed', data.error || 'Unknown error');
+          showToast('Failed to apply model', 'error');
+        }
+      } catch (err) {
+        setTerminal('Model Apply Error', err.message);
+        showToast(`Apply error: ${err.message}`, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function handleAddKey() {
+      const btn = document.getElementById('btnAddKey');
+      const indexVal = document.getElementById('newKeyIndex').value.trim();
+      const apiKeyVal = document.getElementById('newKeyValue').value.trim();
+      const tenantVal = document.getElementById('newKeyTenant').value.trim();
+
+      if (!apiKeyVal) {
+        showToast('API Key를 입력해주세요', 'error');
+        return;
+      }
+      btn.disabled = true;
+      setTerminal('Adding Key', `Adding key (index=${indexVal || 'auto'})...`);
+      try {
+        const res = await fetch('/api/keys/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            index: indexVal ? Number(indexVal) : null,
+            api_key: apiKeyVal,
+            tenant_id: tenantVal
+          }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          document.getElementById('newKeyIndex').value = '';
+          document.getElementById('newKeyValue').value = '';
+          document.getElementById('newKeyTenant').value = '';
+          setTerminal('Key Added', data.output || `Added ${data.key_ref}`);
+          showToast(`Added ${data.key_ref} successfully`, 'success');
+          await fetchKeys();
+        } else {
+          setTerminal('Add Key Failed', data.error || 'Unknown error');
+          showToast(data.error || 'Failed to add key', 'error');
+        }
+      } catch (err) {
+        setTerminal('Add Key Error', err.message);
+        showToast(`Add key error: ${err.message}`, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function handleDeleteKey(keyRef, index) {
+      if (!confirm(`정말 ${keyRef} (Index ${index}) 키를 풀에서 삭제할까요?`)) return;
+      setTerminal('Deleting Key', `Deleting ${keyRef} (index=${index})...`);
+      try {
+        const res = await fetch('/api/keys/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key_ref: keyRef, index: index }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          setTerminal('Key Deleted', data.output || `Deleted ${keyRef}`);
+          showToast(`Deleted ${keyRef} successfully`, 'success');
+          await fetchKeys();
+        } else {
+          setTerminal('Delete Key Failed', data.error || 'Unknown error');
+          showToast(data.error || 'Failed to delete key', 'error');
+        }
+      } catch (err) {
+        setTerminal('Delete Key Error', err.message);
+        showToast(`Delete key error: ${err.message}`, 'error');
+      }
+    }
+
     function toggleAutoRefresh(enabled) {
       if (autoRefreshTimer) clearInterval(autoRefreshTimer);
       if (enabled) {
@@ -923,6 +1279,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     window.addEventListener('DOMContentLoaded', () => {
       fetchKeys();
       fetchHealth();
+      fetchConfig();
       toggleAutoRefresh(true);
     });
   </script>
@@ -966,6 +1323,24 @@ class RouterHandler(http.server.BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             self._send_html(200, DASHBOARD_HTML)
+        elif path == "/api/config":
+            try:
+                cfg_path = os.path.expanduser("~/.agy-router/config.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg_data = json.load(f)
+                else:
+                    cfg_data = {"model": "gemini-4-argon"}
+                cfg_data["available_models"] = [
+                    "gemini-4-argon",
+                    "gemini-3.8-flash",
+                    "gemini-3.7-flash",
+                    "gemini-3.5-flash",
+                    "gemini-2.5-flash"
+                ]
+                self._send_json(200, cfg_data)
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
         elif path == "/api/keys":
             keys = get_keys_data()
             self._send_json(200, keys)
@@ -979,7 +1354,28 @@ class RouterHandler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/api/discover":
+        if path == "/api/config":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(length) if length else b"{}"
+                data = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                
+                cfg_path = os.path.expanduser("~/.agy-router/config.json")
+                cfg_dict = {}
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg_dict = json.load(f)
+                
+                if "model" in data:
+                    cfg_dict["model"] = data["model"]
+                
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg_dict, f, indent=2)
+                
+                self._send_json(200, {"success": True, "config": cfg_dict})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+        elif path == "/api/discover":
             res = run_cli("key-pool", "discover")
             self._send_json(200, {
                 "success": res["success"],
@@ -997,6 +1393,31 @@ class RouterHandler(http.server.BaseHTTPRequestHandler):
                 "error": res["stderr"],
                 "command": res["command"],
             })
+        elif path == "/api/keys/add":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(length) if length else b"{}"
+                data = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                res = add_key_to_pool(
+                    api_key=data.get("api_key", ""),
+                    index=data.get("index"),
+                    tenant_id=data.get("tenant_id", ""),
+                )
+                self._send_json(200 if res.get("success") else 400, res)
+            except Exception as e:
+                self._send_json(500, {"success": False, "error": str(e)})
+        elif path == "/api/keys/delete":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(length) if length else b"{}"
+                data = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                res = delete_key_from_pool(
+                    key_ref=data.get("key_ref"),
+                    index=data.get("index"),
+                )
+                self._send_json(200 if res.get("success") else 400, res)
+            except Exception as e:
+                self._send_json(500, {"success": False, "error": str(e)})
         else:
             self._send_json(404, {"error": "Not Found", "path": path})
 

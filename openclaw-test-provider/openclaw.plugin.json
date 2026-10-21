@@ -1,0 +1,35 @@
+{
+  "id": "antigravity-test",
+  "name": "Antigravity Test Provider",
+  "description": "Test-only OpenClaw Model Provider for Antigravity (single API key)",
+  "providers": ["antigravity-test"],
+  "modelSupport": {
+    "modelPrefixes": ["antigravity-test/"]
+  },
+  "setup": {
+    "providers": [
+      {
+        "id": "antigravity-test",
+        "envVars": ["AGY_KEY_1"]
+      }
+    ]
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "antigravity-test",
+      "method": "api-key",
+      "choiceId": "antigravity-test-api-key",
+      "choiceLabel": "Antigravity Test API Key",
+      "groupId": "antigravity-test",
+      "groupLabel": "Antigravity Test",
+      "cliFlag": "--antigravity-test-api-key",
+      "cliOption": "--antigravity-test-api-key <key>",
+      "cliDescription": "Antigravity Test API key"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

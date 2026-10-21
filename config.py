@@ -25,6 +25,9 @@ class RouterConfig:
     # Phase 8-2: request-level round-robin across distinct projects/tenants.
     # Default OFF so the legacy environment_id-based routing is unchanged.
     request_round_robin: bool = False
+    # Model override for Antigravity agent (e.g. "gemini-4-argon", "gemini-3.8-flash")
+    # None uses the agent default (gemini-3.8-flash).
+    model: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -76,6 +79,7 @@ def load_config(
         'AGY_GIT_AUTO_CHECKPOINT': ('git_auto_checkpoint', lambda x: x.lower() in ('true', '1', 'yes')),
         'AGY_DEFAULT_SESSION_TIMEOUT': ('default_session_timeout', int),
         'AGY_REQUEST_ROUND_ROBIN': ('request_round_robin', lambda x: x.lower() in ('true', '1', 'yes')),
+        'AGY_MODEL': ('model', str),
     }
 
     for env_var, (attr, converter) in env_overrides.items():

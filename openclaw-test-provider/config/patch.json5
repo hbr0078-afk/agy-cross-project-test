@@ -1,0 +1,49 @@
+// Additive config patch: register the local Antigravity test provider and allow its model.
+// NOTE: arrays replace, so modelPolicy.allow restates all existing entries plus the new one.
+{
+  models: {
+    providers: {
+      "antigravity-test": {
+        baseUrl: "http://127.0.0.1:8765/v1",
+        apiKey: "local-adapter",
+        api: "openai-completions",
+        timeoutSeconds: 300,
+        models: [
+          {
+            id: "antigravity-preview-05-2026",
+            name: "Antigravity Preview 05-2026 (Test)",
+            reasoning: false,
+            input: ["text"],
+            contextWindow: 1048576,
+            maxTokens: 65536,
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      modelPolicy: {
+        allow: [
+          "custom-127-0-0-1-3000/gemini-2.5-flash",
+          "custom-127-0-0-1-3000/gemini-3.5-flash-lite",
+          "custom-127-0-0-1-3000/gemini-3-flash-preview",
+          "custom-127-0-0-1-3000/gemini-3.5-flash",
+          "custom-127-0-0-1-3000/gemini-3.6-flash",
+          "custom-127-0-0-1-3000/gemini-3.7-flash",
+          "custom-127-0-0-1-3000/gemma-4-31b-it",
+          "custom-127-0-0-1-3000/nvidia/nemotron-3-super-120b-a12b:free",
+          "custom-127-0-0-1-3000/gemini-3.1-flash-lite-preview",
+          "custom-127-0-0-1-3000/nvidia/nemotron-3-ultra-550b-a55b",
+          "custom-127-0-0-1-3000/nvidia/nemotron-3-ultra-550b-a55b:free",
+          "custom-127-0-0-1-3000/moonshotai/kimi-k3",
+          "custom-127-0-0-1-3000/gemini-3.8-flash",
+          "custom-127-0-0-1-3000/deepseek-ai/deepseek-v4.1-flash",
+          "custom-127-0-0-1-3000/nvidia/nemotron-3.5-super-vl-120b-a12b",
+          "google-interactions/antigravity-preview-05-2026",
+          "antigravity-test/antigravity-preview-05-2026",
+        ],
+      },
+    },
+  },
+}

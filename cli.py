@@ -580,7 +580,7 @@ def cmd_snapshot_restore(args):
 
 def cmd_health(args):
     health = check_health(args.config_path)
-    print("=== agy-router Health ===")
+    print("=== agy-router Health (치이) ===")
     print()
     for check, status in health["checks"].items():
         print(f"{check}: {status}")
@@ -600,7 +600,7 @@ def cmd_diagnostics(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="agy-router", description="Antigravity Multi-Key Router")
+    parser = argparse.ArgumentParser(prog="agy-router", description="Antigravity Multi-Key Router (치이 / Chii)")
     parser.add_argument("--config", dest="config_path", type=str, default=None, help="Path to config file (default: ~/.agy-router/config.json)")
     
     # Root-level config override arguments (CLI > ENV > FILE > DEFAULT)
