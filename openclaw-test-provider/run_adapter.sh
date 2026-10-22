@@ -2,7 +2,7 @@
 # Launch the Antigravity adapter with the FULL key pool loaded from ~/.bashrc.
 # Keys are read from ~/.bashrc (never echoed). Multi-key rollover requires >=2.
 set -u
-cd /home/ubuntu/agy-router/openclaw-test-provider
+cd "$(dirname "$0")"
 
 # Export every AGY_KEY_N / GEMINI_API_KEY(_N) found in ~/.bashrc
 while IFS= read -r line; do

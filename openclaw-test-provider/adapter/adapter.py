@@ -119,10 +119,11 @@ _RUNTIME_CTX_MARKERS = (
     "\u27e6openclaw:ctx\u27e7",
     "Continue the OpenClaw runtime event.",
     "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>",
+    "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
 )
 
 _RUNTIME_CTX_RE = re.compile(
-    r"(?:^|\n)(?:OpenClaw runtime context(?: \(internal\))?:?[\s\S]*?(?:End OpenClaw runtime context\.?|$)|Conversation info: \u27e6openclaw:ctx\u27e7[\s\S]*?(?:End OpenClaw runtime context\.?|$)|Recent chat history: \u27e6openclaw:ctx\u27e7[\s\S]*?(?:End OpenClaw runtime context\.?|$))",
+    r"(?:^|\n)(?:<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>[\s\S]*?(?:<<<END_OPENCLAW_INTERNAL_CONTEXT>>>|$)|OpenClaw runtime context(?: \(internal\))?:?[\s\S]*?(?:<<<END_OPENCLAW_INTERNAL_CONTEXT>>>|End OpenClaw runtime context\.?|$)|Conversation info: \u27e6openclaw:ctx\u27e7[\s\S]*?(?:End OpenClaw runtime context\.?|$)|Recent chat history: \u27e6openclaw:ctx\u27e7[\s\S]*?(?:End OpenClaw runtime context\.?|$))",
     re.IGNORECASE
 )
 
@@ -568,33 +569,41 @@ def _call(messages, tools=None, model=None):
     )
 
     if is_tool_result:
-        tool_call_id = last_msg.get("tool_call_id", "")
-        # OpenClaw가 더미/임의 call_id를 보낸 경우, 세션에 기록된 구글의 진짜 call_id 사용
-        fn_from_msg = last_msg.get("tool_name") or last_msg.get("name")
-        if not fn_from_msg:
-            tc = _find_assistant_tool_call(messages, tool_call_id, "")
-            if tc is not None:
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                fn_from_msg = fn.get("name")
-        func_name = fn_from_msg or st.get("last_func_name", "tool")
-        real_call_id = st.get("last_call_id") or tool_call_id
+        pending_map = st.get("pending_calls") or {}
+        payload_input = []
+        for idx, tm in enumerate(pending_results):
+            tc_id = tm.get("tool_call_id", "")
+            fn_from_msg = tm.get("tool_name") or tm.get("name")
+            if not fn_from_msg:
+                tc = _find_assistant_tool_call(messages, tc_id, "")
+                if tc is not None:
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    fn_from_msg = fn.get("name")
+            mapped_name = pending_map.get(tc_id)
+            func_name = fn_from_msg or mapped_name or st.get("last_func_name", "tool")
+            if tc_id and tc_id in pending_map:
+                real_call_id = tc_id
+            elif len(pending_results) == 1 and st.get("last_call_id"):
+                real_call_id = st.get("last_call_id")
+            else:
+                real_call_id = tc_id or st.get("last_call_id", "")
 
-        content = last_msg.get("content", "")
-        try:
-            parsed_result = json.loads(content)
-        except Exception:
-            parsed_result = {"output": content}
+            content = tm.get("content", "")
+            try:
+                parsed_result = json.loads(content)
+            except Exception:
+                parsed_result = {"output": content}
 
-        payload_input = [
-            {
-                "type": "function_result",
-                "name": func_name,
-                "call_id": real_call_id,
-                "result": parsed_result
-                if isinstance(parsed_result, dict)
-                else {"output": parsed_result},
-            }
-        ]
+            payload_input.append(
+                {
+                    "type": "function_result",
+                    "name": func_name,
+                    "call_id": real_call_id,
+                    "result": parsed_result
+                    if isinstance(parsed_result, dict)
+                    else {"output": parsed_result},
+                }
+            )
         res = _invoke(payload_input, None, tool_bound=True, pinned_key_ref=pinned or env_owner)
         # 500 on a function_result means the interaction is already terminal
         # (Antigravity resolved the tool chain server-side). Do not surface a
@@ -682,11 +691,18 @@ def _call(messages, tools=None, model=None):
         pending_fcs = _pending_function_calls(raw)
         has_function_call = bool(pending_fcs)
         if has_function_call:
+            st["pending_calls"] = {
+                fc.get("id"): fc.get("name", "tool")
+                for fc in pending_fcs
+                if fc.get("id")
+            }
             last_fc = pending_fcs[-1]
             if last_fc.get("id"):
                 st["last_call_id"] = last_fc.get("id")
             if last_fc.get("name"):
                 st["last_func_name"] = last_fc.get("name")
+        else:
+            st.pop("pending_calls", None)
 
         # 핀 수명주기:
         #  - function_call 발행 -> 이 체인을 연 키로 고정
@@ -852,25 +868,28 @@ class Handler(BaseHTTPRequestHandler):
         function_calls = _pending_function_calls(raw)
 
         if function_calls:
-            first_fn = function_calls[0]
-            call_id = first_fn.get("id") or ("call_" + uuid.uuid4().hex[:12])
-            func_name = first_fn.get("name", "")
-            func_args = first_fn.get("arguments") or {}
-            
-            # 세션에 마지막 호출 함수명 기록 (다음 function_result 응답용)
-            st["last_func_name"] = func_name
-            st["last_call_id"] = call_id
-
-            tool_calls = [
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": func_name,
-                        "arguments": json.dumps(func_args, ensure_ascii=False) if isinstance(func_args, dict) else str(func_args),
-                    },
-                }
-            ]
+            tool_calls = []
+            pending_map = {}
+            for fc in function_calls:
+                cid_fc = fc.get("id") or ("call_" + uuid.uuid4().hex[:12])
+                fname = fc.get("name", "")
+                fargs = fc.get("arguments") or {}
+                pending_map[cid_fc] = fname
+                st["last_func_name"] = fname
+                st["last_call_id"] = cid_fc
+                tool_calls.append(
+                    {
+                        "id": cid_fc,
+                        "type": "function",
+                        "function": {
+                            "name": fname,
+                            "arguments": json.dumps(fargs, ensure_ascii=False)
+                            if isinstance(fargs, dict)
+                            else str(fargs),
+                        },
+                    }
+                )
+            st["pending_calls"] = pending_map
             self._send_json(
                 200,
                 {
@@ -950,31 +969,42 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         if function_calls:
-            first_fn = function_calls[0]
-            call_id = first_fn.get("id") or ("call_" + uuid.uuid4().hex[:12])
-            func_name = first_fn.get("name", "")
-            func_args = first_fn.get("arguments") or {}
-
-            st["last_func_name"] = func_name
-            st["last_call_id"] = call_id
-
-            args_str = json.dumps(func_args, ensure_ascii=False) if isinstance(func_args, dict) else str(func_args)
-
-            # 스트림 tool_calls 전송
-            chunk({
-                "role": "assistant",
-                "tool_calls": [
+            stream_tool_calls = []
+            pending_map = {}
+            for idx, fc in enumerate(function_calls):
+                cid_fc = fc.get("id") or ("call_" + uuid.uuid4().hex[:12])
+                fname = fc.get("name", "")
+                fargs = fc.get("arguments") or {}
+                pending_map[cid_fc] = fname
+                st["last_func_name"] = fname
+                st["last_call_id"] = cid_fc
+                args_str = (
+                    json.dumps(fargs, ensure_ascii=False)
+                    if isinstance(fargs, dict)
+                    else str(fargs)
+                )
+                stream_tool_calls.append(
                     {
-                        "index": 0,
-                        "id": call_id,
+                        "index": idx,
+                        "id": cid_fc,
                         "type": "function",
                         "function": {
-                            "name": func_name,
+                            "name": fname,
                             "arguments": args_str,
                         },
                     }
-                ],
-            }, finish="tool_calls", usage=usage_obj)
+                )
+            st["pending_calls"] = pending_map
+
+            # 스트림 tool_calls 전송
+            chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": stream_tool_calls,
+                },
+                finish="tool_calls",
+                usage=usage_obj,
+            )
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
