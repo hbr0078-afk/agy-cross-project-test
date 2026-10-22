@@ -12,7 +12,7 @@ from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
 
 # Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from observability import (
     configure_logging, get_logger, generate_request_id, get_request_id,

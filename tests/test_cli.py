@@ -12,7 +12,8 @@ from unittest import TestCase, mock
 from io import StringIO
 
 # Import CLI functions
-sys.path.insert(0, os.path.dirname(__file__))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
 from cli import (
     cmd_project_register,
     cmd_project_status,
@@ -734,7 +735,7 @@ class TestCLIConfigPrecedenceSubprocess(TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.config_path = os.path.join(self.temp_dir, "config.json")
-        self.cli_path = os.path.join(os.path.dirname(__file__), "cli.py")
+        self.cli_path = os.path.join(ROOT_DIR, "cli.py")
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -835,7 +836,7 @@ class TestCLISecuritySubprocess(TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.config_path = os.path.join(self.temp_dir, "config.json")
-        self.cli_path = os.path.join(os.path.dirname(__file__), "cli.py")
+        self.cli_path = os.path.join(ROOT_DIR, "cli.py")
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)

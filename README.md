@@ -17,7 +17,7 @@ Google Antigravity (Interactions API)의 까다로운 **상태 유지(Stateful) 
 * 에이전트가 보내는 표준 OpenAI 요청(`POST /v1/chat/completions`, `messages`, `tools`, `stream`)을 받아 Google Interactions API(`v1beta/interactions`) 규격으로 자동 번역합니다.
 * 응답 역시 일반 텍스트 스트리밍(SSE)과 병렬 도구 호출(`tool_calls`) 규격으로 맞춰서 에이전트에게 돌려줍니다.
 
-### ② 멀티 키 풀 & 지능형 롤오버 (`key_pool.py`, `rollover_runner.py`)
+### ② 멀티 키 풀 & 지능형 롤오버 (`keys.py`, `openclaw-test-provider/adapter/key_pool.py`, `openclaw-test-provider/adapter/rollover_runner.py`)
 * 여러 개의 API 키(`AGY_KEY_1` ~ `AGY_KEY_N`)를 풀(Pool)로 묶어 라운드로빈/LRU 방식으로 분산 호출합니다.
 * **429 (할당량 초과):** 해당 키를 즉시 `COOLDOWN` 상태로 전환하고 1초 내에 다음 활성 키로 자동 재시도(Rollover)합니다.
 * **401 / 403 (인증 오류):** 해당 키를 `INACTIVE` 처리하고 다음 키로 넘깁니다.
@@ -109,7 +109,7 @@ Antigravity API(무료 티어)를 사용할 때 가장 주의할 병목은 전�
 ### ② 치이 어댑터(`adapter.py`)에 내장된 자동 토큰 절약 기능
 치이 어댑터는 100k TPM 초과를 막기 위해 다음 방어 로직을 자동으로 수행합니다 (환경변수로 조절 가능):
 1. **과거 도구 결과 자동 압축 (`AGY_ADAPTER_MAX_OLD_TOOL_CHARS=3500`):** 최근 4개 메시지 이전의 오래된 도구 실행 결과(`role: tool`)가 3,500자를 넘으면 앞뒤 핵심만 남기고 가운데를 `...[trimmed]...`로 자동 생략합니다.
-2. **전체 프롬프트 상한 방어 (`AGY_ADAPTER_MAX_PROMPT_CHARS=240000`):** 전체 입력 페이로드가 24만 자(약 70~80k 토큰)를 넘으면 시스템 프롬프트는 보존하고 가장 오래된 대화 턴부터 자동으로 드롭합니다.
+2. **한/영 가중치 기반 프롬프트 토큰 상한 방어 (`AGY_ADAPTER_MAX_PROMPT_TOKENS=75000`):** 단순 글자 수가 아닌 한글/CJK(글자당 약 1토큰)와 영문/ASCII(글자당 약 0.3토큰) 가중치를 계산하는 토큰 추정기(`_estimate_tokens`)로 약 75k 토큰 상한을 방어하며, 초과 시 시스템 프롬프트는 보존하고 오래된 대화 턴을 생략하면서 **생략된 메시지 개수(`N earlier message(s) omitted`)**를 명시적으로 남깁니다.
 3. **멀티모달 이미지 개수 제한:** 이미지가 대화에 계속 쌓여 용량이 폭발하지 않도록 **최근 5개 이미지**만 전송합니다.
 
 ### ③ 에이전트 세팅 시 실전 토큰 절약 팁 5가지

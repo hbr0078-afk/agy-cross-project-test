@@ -266,9 +266,25 @@ def _extract_images_from_content(content) -> list[dict]:
     return images
 
 
-# 단일 요청 입력 페이로드 상한(글자 수). 무료 티어 100k TPM 한도를 절대 넘지 않도록 방어
+# 단일 요청 입력 페이로드 상한(토큰 및 글자 수). 무료 티어 100k TPM 한도를 절대 넘지 않도록 방어
+_MAX_PROMPT_TOKENS = int(os.environ.get("AGY_ADAPTER_MAX_PROMPT_TOKENS", "75000"))
 _MAX_PROMPT_CHARS = int(os.environ.get("AGY_ADAPTER_MAX_PROMPT_CHARS", "240000"))
 _MAX_OLD_TOOL_RESULT_CHARS = int(os.environ.get("AGY_ADAPTER_MAX_OLD_TOOL_CHARS", "3500"))
+
+
+def _estimate_tokens(text: str) -> int:
+    """한글/CJK 및 멀티바이트 문자 비중을 반영한 휴리스틱 토큰 추정기.
+
+    영문/ASCII는 평균 ~3.5~4글자당 1토큰이지만, 한국어/CJK는 글자당 ~0.9~1.2토큰을 소모한다.
+    단순 글자 수(24만 자)만 기준으로 삼으면 한국어 비중이 높을 때 100k TPM 한도를 초과하므로
+    ASCII와 비-ASCII 문자를 분리 계산하여 보수적으로 추정한다.
+    """
+    if not text:
+        return 0
+    ascii_count = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_count = len(text) - ascii_count
+    # ASCII: ~3.5 chars/token, 한국어/CJK(Non-ASCII): ~1.1 tokens/char
+    return max(1, int(ascii_count / 3.5 + non_ascii_count * 1.1))
 
 
 def _extract_prompt(messages: list):
@@ -316,9 +332,11 @@ def _extract_prompt(messages: list):
             if raw_text:
                 if idx < recent_cutoff and len(raw_text) > _MAX_OLD_TOOL_RESULT_CHARS:
                     half = _MAX_OLD_TOOL_RESULT_CHARS // 2
+                    omitted_chars = len(raw_text) - _MAX_OLD_TOOL_RESULT_CHARS
+                    omitted_toks = _estimate_tokens(raw_text[half:-half])
                     trimmed = (
                         raw_text[:half]
-                        + f"\n...[trimmed {len(raw_text) - _MAX_OLD_TOOL_RESULT_CHARS} chars]...\n"
+                        + f"\n...[trimmed {omitted_chars} chars (~{omitted_toks} tokens) from old tool output]...\n"
                         + raw_text[-half:]
                     )
                     conv_blocks.append(f"[Tool Result: {name}]\n{trimmed}")
@@ -335,22 +353,46 @@ def _extract_prompt(messages: list):
     conv_text = "\n\n".join(conv_blocks).strip()
     full_prompt = ("\n\n".join(x for x in (sys_text, conv_text) if x)).strip() or "Hello"
 
-    # 만약 전체 프롬프트가 _MAX_PROMPT_CHARS를 초과하면 시스템 프롬프트 + 최신 대화 블록 위주로 유지
-    if len(full_prompt) > _MAX_PROMPT_CHARS and conv_blocks:
-        budget = max(30000, _MAX_PROMPT_CHARS - len(sys_text) - 200)
+    # 전체 프롬프트가 토큰 상한(_MAX_PROMPT_TOKENS) 또는 글자 수 상한(_MAX_PROMPT_CHARS)을 초과하면
+    # 시스템 프롬프트 + 최신 대화 블록 위주로 유지하고, 드롭된 턴 수와 토큰 수를 명시적으로 기록
+    if conv_blocks and (
+        _estimate_tokens(full_prompt) > _MAX_PROMPT_TOKENS
+        or len(full_prompt) > _MAX_PROMPT_CHARS
+    ):
+        sys_tokens = _estimate_tokens(sys_text)
+        token_budget = max(12000, _MAX_PROMPT_TOKENS - sys_tokens - 300)
+        char_budget = max(30000, _MAX_PROMPT_CHARS - len(sys_text) - 300)
         kept_tail: list[str] = []
-        used = 0
+        used_tokens = 0
+        used_chars = 0
         for blk in reversed(conv_blocks):
-            if used + len(blk) + 2 > budget and kept_tail:
+            blk_tokens = _estimate_tokens(blk) + 2
+            blk_chars = len(blk) + 2
+            if kept_tail and (
+                used_tokens + blk_tokens > token_budget
+                or used_chars + blk_chars > char_budget
+            ):
                 break
-            if not kept_tail and len(blk) > budget:
-                kept_tail.append(blk[-budget:])
-                used += budget
+            if not kept_tail and (blk_tokens > token_budget or blk_chars > char_budget):
+                safe_chars = min(len(blk), char_budget, token_budget * 2)
+                sliced = blk[-safe_chars:]
+                kept_tail.append(sliced)
+                used_tokens += _estimate_tokens(sliced)
+                used_chars += len(sliced)
                 break
             kept_tail.append(blk)
-            used += len(blk) + 2
+            used_tokens += blk_tokens
+            used_chars += blk_chars
         kept_tail.reverse()
-        trimmed_conv = "[...Earlier conversation trimmed to fit 100k token limit...]\n\n" + "\n\n".join(kept_tail)
+        dropped_count = max(0, len(conv_blocks) - len(kept_tail))
+        dropped_tokens = max(
+            0, _estimate_tokens(conv_text) - _estimate_tokens("\n\n".join(kept_tail))
+        )
+        notice = (
+            f"[Context Notice: {dropped_count} earlier conversation blocks "
+            f"(~{dropped_tokens} est. tokens) were omitted to stay within the 100k TPM limit.]"
+        )
+        trimmed_conv = notice + "\n\n" + "\n\n".join(kept_tail)
         full_prompt = ("\n\n".join(x for x in (sys_text, trimmed_conv) if x)).strip()
 
     if images:
@@ -755,13 +797,18 @@ def _openai_usage(res: dict, messages: list) -> dict:
     )
     if prompt_tokens <= 0:
         try:
-            prompt_tokens = max(1, len(_extract_prompt(messages)) // 4)
+            extracted = _extract_prompt(messages)
+            if isinstance(extracted, list):
+                text_part = next((p.get("text", "") for p in extracted if isinstance(p, dict) and p.get("type") == "text"), "")
+                prompt_tokens = _estimate_tokens(text_part)
+            else:
+                prompt_tokens = _estimate_tokens(str(extracted))
         except Exception:
             prompt_tokens = 0
     if completion_tokens <= 0:
         out_text = str((res or {}).get("output") or "")
         if out_text:
-            completion_tokens = max(1, len(out_text) // 4)
+            completion_tokens = _estimate_tokens(out_text)
     total_tokens = int(u.get("total_tokens") or u.get("total_token_count") or (prompt_tokens + completion_tokens))
     usage_obj = {
         "prompt_tokens": prompt_tokens,
