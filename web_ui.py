@@ -319,7 +319,7 @@ def add_key_to_pool(api_key, index=None, tenant_id=""):
     """Add or update an AGY_KEY_<index> in ~/.bashrc, key_states.json, and restart adapter."""
     api_key = (api_key or "").strip()
     tenant_id = (tenant_id or "").strip()
-    if not api_key or not re.match(r"^[A-Za-z0-9_\-]+$", api_key):
+    if not api_key or not re.match(r"^[A-Za-z0-9_\-\.]+$", api_key):
         return {"success": False, "error": "유효한 API Key 형식이 아닙니다."}
 
     bashrc_path = os.path.expanduser("~/.bashrc")

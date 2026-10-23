@@ -198,13 +198,13 @@ class RequestContext:
 # Secret redaction patterns
 SECRET_PATTERNS = [
     # Google API keys
-    (r'AIza[A-Za-z0-9_\-]{30,}', '***REDACTED_API_KEY***'),
+    (r'AIza[A-Za-z0-9_\-\.]{30,}', '***REDACTED_API_KEY***'),
     # Generic bearer tokens
     (r'Bearer\s+[A-Za-z0-9_\-\.]{20,}', 'Bearer ***REDACTED***'),
     # Authorization headers
     (r'Authorization:\s*[A-Za-z0-9_\-\.]{20,}', 'Authorization: ***REDACTED***'),
     # x-goog-api-key headers
-    (r'x-goog-api-key:\s*[A-Za-z0-9_\-]{20,}', 'x-goog-api-key: ***REDACTED***'),
+    (r'x-goog-api-key:\s*[A-Za-z0-9_\-\.]{20,}', 'x-goog-api-key: ***REDACTED***'),
     # Generic password/secret patterns
     (r'(password|secret|token|credential|apikey|api_key)["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-\.]{10,}',
      r'\1=***REDACTED***'),

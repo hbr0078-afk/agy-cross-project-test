@@ -17,7 +17,7 @@ def mask_credentials(text: str) -> str:
     masked = re.sub(r'(https?://[^:\s]+:)([^@\s]+)(@)', r'\1***\3', text)
     masked = re.sub(r'(gh[pousr]_[A-Za-z0-9_]{20,})', r'***', masked)
     masked = re.sub(r'(github_pat_[A-Za-z0-9_]{20,})', r'***', masked)
-    masked = re.sub(r'(AIza[A-Za-z0-9_\-]{30,})', r'***', masked)
+    masked = re.sub(r'(AIza[A-Za-z0-9_\-\.]{30,})', r'***', masked)
     return masked
 
 class PathTraversalError(Exception):
