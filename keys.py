@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import fcntl
 import tempfile
 from typing import Dict, Any, Optional, List, Tuple
 from file_lock import FileAndThreadLock

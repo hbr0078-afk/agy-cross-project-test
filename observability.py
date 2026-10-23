@@ -864,11 +864,11 @@ def get_diagnostics(
     try:
         git_branch = subprocess.run(
             ["git", "branch", "--show-current"],
-            capture_output=True, text=True, cwd="/home/ubuntu/agy-router"
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__))
         ).stdout.strip() or "unknown"
         git_commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, cwd="/home/ubuntu/agy-router"
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__))
         ).stdout.strip() or "unknown"
     except Exception:
         pass

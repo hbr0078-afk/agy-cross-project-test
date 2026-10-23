@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import time
 from urllib.parse import urlparse
 
 PORT = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8080))
-DEFAULT_PROJECT_DIR = "/home/ubuntu/agy-router"
+DEFAULT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def find_cli_path():
@@ -260,7 +261,6 @@ def get_keys_data():
     """Retrieve keys from key_states.json or fallback to CLI."""
     file_candidates = [
         os.path.expanduser("~/.agy-router/key_states.json"),
-        "/home/ubuntu/.agy-router/key_states.json",
         os.path.join(DEFAULT_PROJECT_DIR, "key_states.json"),
     ]
     for path in file_candidates:
@@ -361,15 +361,22 @@ def add_key_to_pool(api_key, index=None, tenant_id=""):
     tmp_bashrc = bashrc_path + ".tmp-webui"
     with open(tmp_bashrc, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
-    os.chmod(tmp_bashrc, 0o600)
+    try:
+        os.chmod(tmp_bashrc, 0o600)
+    except Exception:
+        pass
 
-    chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
-    if chk.returncode != 0:
-        os.remove(tmp_bashrc)
-        return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
+    if os.name != "nt" and shutil.which("bash"):
+        chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
+        if chk.returncode != 0:
+            os.remove(tmp_bashrc)
+            return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
 
     os.replace(tmp_bashrc, bashrc_path)
-    os.chmod(bashrc_path, 0o600)
+    try:
+        os.chmod(bashrc_path, 0o600)
+    except Exception:
+        pass
 
     # Update tenants.env if tenant_id provided
     if tenant_id:
@@ -394,7 +401,10 @@ def add_key_to_pool(api_key, index=None, tenant_id=""):
             new_t_lines.append(f"AGY_TENANT_{idx}={tenant_id}\n")
         with open(tenants_path, "w", encoding="utf-8") as f:
             f.writelines(new_t_lines)
-        os.chmod(tenants_path, 0o600)
+        try:
+            os.chmod(tenants_path, 0o600)
+        except Exception:
+            pass
 
     # Update key_states.json immediately
     state_path = os.path.expanduser("~/.agy-router/key_states.json")
@@ -423,10 +433,17 @@ def add_key_to_pool(api_key, index=None, tenant_id=""):
 
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state_data, f, indent=2, ensure_ascii=False)
-    os.chmod(state_path, 0o600)
+    try:
+        os.chmod(state_path, 0o600)
+    except Exception:
+        pass
 
     disc = run_cli("key-pool", "discover")
-    subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+    if os.name != "nt" and shutil.which("systemctl"):
+        try:
+            subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+        except Exception:
+            pass
 
     return {
         "success": True,
@@ -470,13 +487,20 @@ def delete_key_from_pool(key_ref=None, index=None):
         tmp_bashrc = bashrc_path + ".tmp-webui"
         with open(tmp_bashrc, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
-        os.chmod(tmp_bashrc, 0o600)
-        chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
-        if chk.returncode != 0:
-            os.remove(tmp_bashrc)
-            return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
+        try:
+            os.chmod(tmp_bashrc, 0o600)
+        except Exception:
+            pass
+        if os.name != "nt" and shutil.which("bash"):
+            chk = subprocess.run(["bash", "-n", tmp_bashrc], capture_output=True, text=True)
+            if chk.returncode != 0:
+                os.remove(tmp_bashrc)
+                return {"success": False, "error": f"bashrc 문법 검증 실패: {chk.stderr}"}
         os.replace(tmp_bashrc, bashrc_path)
-        os.chmod(bashrc_path, 0o600)
+        try:
+            os.chmod(bashrc_path, 0o600)
+        except Exception:
+            pass
 
     # Remove from key_states.json
     state_path = os.path.expanduser("~/.agy-router/key_states.json")
@@ -497,7 +521,11 @@ def delete_key_from_pool(key_ref=None, index=None):
         except Exception:
             pass
 
-    subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+    if os.name != "nt" and shutil.which("systemctl"):
+        try:
+            subprocess.run(["systemctl", "--user", "restart", "agy-adapter.service"], capture_output=True)
+        except Exception:
+            pass
     return {
         "success": True,
         "key_ref": key_ref_norm,

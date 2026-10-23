@@ -8,7 +8,14 @@ Kept dependency-free on purpose: no agy-router imports.
 """
 
 import os
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 import threading
 from typing import Callable, Any
 
@@ -60,7 +67,14 @@ class FileAndThreadLock:
             if lock_dir and not os.path.exists(lock_dir):
                 os.makedirs(lock_dir, mode=0o700, exist_ok=True)
             fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                # Best-effort only: never block or crash on Windows.
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    pass
             self._state.local.fd = fd
             self._state.local.depth = 1
         else:
@@ -74,7 +88,10 @@ class FileAndThreadLock:
                 fd = getattr(self._state.local, "fd", None)
                 if fd is not None:
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        if fcntl is not None:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        elif msvcrt is not None:
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                     except OSError:
                         pass
                     try:

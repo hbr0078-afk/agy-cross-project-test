@@ -71,11 +71,39 @@ _MULTIKEY = os.environ.get("AGY_ADAPTER_MULTIKEY", "auto").lower() == "auto" and
 
 if not AGY_KEY and not _DISCOVERED:
     print(
-        "ERROR: no API key found (checked AGY_KEY_1 / GEMINI_API_KEY / "
-        "AGY_KEY_N / GEMINI_API_KEY_N / ~/.bashrc / openclaw.json)",
+        "WARNING: no API key found yet. Waiting for keys via Web UI "
+        "(http://localhost:8080)...",
         file=sys.stderr,
     )
-    sys.exit(1)
+
+
+def _reload_keys_if_needed():
+    """~/.bashrc의 AGY_KEY_N/GEMINI_API_KEY export를 env에 재적재하고 키 풀을 갱신.
+
+    Web UI(Windows/Linux)에서 키를 추가/삭제하면 프로세스 재시작 없이 즉시 반영된다.
+    """
+    global AGY_KEY, _DISCOVERED, _MULTIKEY
+    try:
+        bashrc_path = os.path.expanduser("~/.bashrc")
+        if os.path.exists(bashrc_path):
+            pat = re.compile(
+                r"^export\s+(AGY_KEY_\d+|GEMINI_API_KEY(?:_\d+)?)=(.+)$")
+            with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    m = pat.match(line.strip())
+                    if m:
+                        val = m.group(2).strip().strip("\"'").strip()
+                        if val:
+                            os.environ[m.group(1)] = val
+        if not AGY_KEY:
+            AGY_KEY = os.environ.get("AGY_KEY_1") or os.environ.get("GEMINI_API_KEY")
+        _DISCOVERED = _KEY_POOL.discover_keys()
+        _MULTIKEY = (
+            os.environ.get("AGY_ADAPTER_MULTIKEY", "auto").lower() == "auto"
+            and len(_DISCOVERED) > 1
+        )
+    except Exception:
+        pass
 
 PORT = int(os.environ.get("ANTIGRAVITY_ADAPTER_PORT", "8765"))
 MODEL_ID = "antigravity-preview-09-2026"
@@ -540,6 +568,7 @@ def _get_target_model(model=None):
 
 
 def _call(messages, tools=None, model=None):
+    _reload_keys_if_needed()
     key = _conv_key(messages)
     st = _SESSIONS.setdefault(key, {})
 
@@ -647,17 +676,21 @@ def _call(messages, tools=None, model=None):
                 }
             )
         res = _invoke(payload_input, None, tool_bound=True, pinned_key_ref=pinned or env_owner)
-        # 500 on a function_result means the interaction is already terminal
-        # (Antigravity resolved the tool chain server-side). Do not surface a
-        # hard error: drop the stale session and continue as a fresh text turn
-        # carrying the full transcript (which already includes the tool result).
-        if not res.get("success") and res.get("status_code") == 500:
-            _dbg({"event": "function_result_terminal_recover"})
+        # 500 or unpinned 404 on a function_result means the interaction/session
+        # is already terminal or expired. Do not surface a hard error: drop the
+        # stale session and continue as a fresh text turn carrying the full
+        # transcript (which already includes the tool result).
+        if not res.get("success") and (
+            res.get("status_code") == 500
+            or (res.get("status_code") == 404 and not res.get("pin_failure"))
+        ):
+            _dbg({"event": "function_result_terminal_recover", "status": res.get("status_code")})
             st.pop("pin_key_ref", None)
             st.pop("environmentId", None)
             st.pop("previousInteractionId", None)
             st.pop("env_key_ref", None)
-            res = _invoke(_extract_prompt(messages), agy_tools, tool_bound=False)
+            res = _invoke(_extract_prompt(messages), agy_tools, tool_bound=False,
+                          pinned_key_ref=None)
     else:
         # 새 텍스트 턴: 각 테넌트에 분산된 TPM 쿼터를 100% 활용하기 위해
         # 이전 세션 환경(environmentId) 및 키 고정(pin_key_ref)을 매 턴 초기화하고,
@@ -698,10 +731,11 @@ def _call(messages, tools=None, model=None):
         st.pop("environmentId", None)
         st.pop("previousInteractionId", None)
         st.pop("env_key_ref", None)
-        # 키 가용성 문제(쿼터 소진/권한)로 인한 실패면 사용자에게 429를 노출하지 않고
-        # 새 키로 투명 재시도한다. (env를 이미 드롭했으므로 자유 순환 경로가 유효하며,
-        # 툴 결과 턴이라도 _extract_prompt가 직전 툴 결과를 모두 포함하므로 맥락이 유지됨)
-        if _pf_status in (401, 403, 429):
+        # 키 가용성 문제(쿼터 소진/권한) 또는 세션/환경 만료(404)로 인한 실패면
+        # 사용자에게 오류를 노출하지 않고 새 키로 투명 재시도한다. (env를 이미 드롭했으므로
+        # 자유 순환 경로가 유효하며, 툴 결과 턴이라도 _extract_prompt가 직전 툴 결과를
+        # 모두 포함하므로 맥락이 유지됨)
+        if _pf_status in (401, 403, 404, 429):
             _dbg({"event": "pin_quota_reroute", "status": _pf_status, "from_tool": is_tool_result})
             res = _invoke(_extract_prompt(messages), agy_tools, tool_bound=False,
                           pinned_key_ref=None)
@@ -872,6 +906,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- 레거시 직접 호출 ---
     def _handle_interactions(self, data: dict) -> None:
+        _reload_keys_if_needed()
         _kw = dict(
             prompt=data.get("prompt", ""),
             environment_id=data.get("environment_id"),

@@ -1,7 +1,6 @@
 import os
 import json
 import tempfile
-import fcntl
 import time
 from typing import Dict, Any, Optional, List
 from file_lock import FileAndThreadLock

@@ -18,7 +18,6 @@ import os
 import re
 import json
 import time
-import fcntl  # noqa: F401  (kept for parity with upstream import block)
 import tempfile
 import sys
 from typing import Dict, Any, Optional, List, Tuple
